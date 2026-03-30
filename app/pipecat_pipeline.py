@@ -119,6 +119,20 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 
 from app.config import GROQ_API_KEY, SARVAM_API_KEY
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Load Silero VAD model once at module level (not per-connection)
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("VAD: loading Silero VAD model…")
+_silero_model, _ = torch.hub.load(
+    repo_or_dir="snakers4/silero-vad",
+    model="silero_vad",
+    force_reload=False,
+    verbose=False,
+    trust_repo=True,
+)
+_silero_model.eval()
+logger.info("VAD: Silero VAD model ready")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom Frame Types
@@ -211,18 +225,7 @@ class VADProcessor(FrameProcessor):
     def __init__(self, browser_sample_rate: int = 48000, **kwargs):
         super().__init__(**kwargs)
         self._browser_rate = browser_sample_rate
-
-        # Load Silero VAD model (downloads ~1.5 MB once, then cached locally)
-        logger.info("VAD: loading Silero VAD model…")
-        self._model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            verbose=False,
-        )
-        self._model.eval()
-        logger.info("VAD: Silero VAD model ready")
-
+        self._model = _silero_model   # reuse the module-level singleton
         self._reset_vad_state()
 
     def update_sample_rate(self, rate: int):

@@ -21,6 +21,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY app/ ./app/
 COPY services/ ./services/
 
+# Pre-download Silero VAD model into the torch hub cache so no network
+# access is needed at runtime (avoids NO_SOCKET errors on Railway)
+RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False, verbose=False, trust_repo=True)"
+
 EXPOSE 8000
 
 CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
