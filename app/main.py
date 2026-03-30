@@ -22,11 +22,17 @@ main.py is pure I/O routing.
 
 import asyncio
 import json
+import sys
 import time
 
 from fastapi import FastAPI, File, UploadFile, WebSocket
 from loguru import logger
 import shutil
+
+# Railway (and most log aggregators) treat stderr as errors.
+# Redirect loguru to stdout so log levels are reported correctly.
+logger.remove()
+logger.add(sys.stdout, level="DEBUG")
 
 from app.pipeline import run_pipeline                  # keeps the POST /voice endpoint working
 from app.pipecat_pipeline import (
