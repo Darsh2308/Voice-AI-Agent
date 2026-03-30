@@ -30,6 +30,10 @@ loguru>=0.7.0        # structured logging used by pipecat internally
 langgraph>=0.2.0     # state graph engine + MemorySaver checkpointer
 langchain-core>=0.3.0  # HumanMessage, AIMessage, BaseMessage types
 
+# ── New features ──────────────────────────────────────────────────────────────
+ddgs>=7.0.0               # Feature 9: web search tool (renamed from duckduckgo-search)
+langdetect>=1.0.9          # Feature 7: language detection fallback
+
 # ── Silero VAD: neural voice activity detection ───────────────────────────────
 torch>=2.0.0         # PyTorch runtime (CPU-only is fine, no GPU needed)
 torchaudio>=2.0.0    # required by silero-vad for audio utilities

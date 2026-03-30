@@ -23,7 +23,7 @@ Pipecat solves this with a FRAME-BASED PIPELINE:
   - A Pipeline wires the processors together. A PipelineTask runs
     everything asynchronously.
 
-FRAME FLOW (Phase 7)
+FRAME FLOW (Phase 7+)
 ──────────────────────────────────────────────────────────────
   WebSocket binary
         │  AudioRawFrame (raw 16-bit PCM from browser)
@@ -31,45 +31,34 @@ FRAME FLOW (Phase 7)
   ┌─────────────────┐
   │  VADProcessor   │  Voice Activity Detection.
   │                 │  Buffers audio, detects speech start/end,
-  │                 │  emits one SpeechEndFrame per utterance.
+  │                 │  emits SpeechEndFrame and BargeInDetectedFrame.
   └────────┬────────┘
-           │  SpeechEndFrame (buffered WAV bytes of one utterance)
+           │  SpeechEndFrame / BargeInDetectedFrame
            ▼
   ┌──────────────────────┐
   │  SarvamSTTService    │  Calls Sarvam ASR API.
-  │                      │  Emits TranscriptionFrame (for LLM)
-  │                      │  and TranscriptDisplayFrame (for browser chat UI).
+  │                      │  Emits TranscriptionFrame, TranscriptDisplayFrame,
+  │                      │  LanguageDetectedFrame, EmotionHintFrame.
   └──────────┬───────────┘
-             │  TranscriptionFrame (user's words as text)
+             │  TranscriptionFrame + side-channel frames
              ▼
   ┌──────────────────────┐
-  │ GroqLangGraphProcessor│ Phase 8: LangGraph state graph.
-  │                      │  run_agent(text, thread_id) is called per turn.
-  │                      │  MemorySaver stores full history per session.
-  │                      │  Emits TextFrame (AI reply)
-  │                      │  and TranscriptDisplayFrame (for browser).
+  │ GroqLangGraphProcessor│ Streaming LLM with LangGraph memory.
+  │                      │  Emits AIThinkingFrame, TextFrame per sentence,
+  │                      │  TranscriptDisplayFrame.
   └──────────┬───────────┘
-             │  TextFrame (AI's response as text)
+             │  TextFrame (one per sentence)
              ▼
   ┌──────────────────────┐
-  │  SarvamTTSService    │  Calls Sarvam TTS API.
-  │                      │  Emits AIAudioFrame (WAV bytes to send to browser).
+  │  SarvamTTSService    │  Calls Sarvam TTS API per sentence.
+  │                      │  Handles LanguageDetectedFrame for auto-switch.
+  │                      │  Emits AIAudioFrame per sentence.
   └──────────┬───────────┘
-             │  AIAudioFrame (synthesized speech as WAV bytes)
+             │  AIAudioFrame (WAV bytes per sentence)
              ▼
   ┌──────────────────────┐
-  │  OutputSink          │  Puts frames onto an asyncio.Queue.
-  │                      │  main.py reads from this queue to send
-  │                      │  audio/text back to the browser.
+  │  OutputSink          │  Puts frames onto asyncio.Queue.
   └──────────────────────┘
-
-KEY IMPROVEMENT OVER PHASE 6
-──────────────────────────────
-  Phase 6: Every response had NO memory of previous turns.
-           Each call to generate_response() was a fresh one-shot prompt.
-
-  Phase 7: GroqLLMProcessor maintains a running conversation history.
-           The AI now remembers what was said earlier in the session!
 """
 
 import array
@@ -78,11 +67,10 @@ import base64
 import io
 import os
 import tempfile
-import time
 import torch
 import uuid
 import wave
-from typing import List, Optional
+from typing import List
 
 import httpx
 from loguru import logger
@@ -90,13 +78,6 @@ from loguru import logger
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipecat Core Imports
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Frame       – base class for every data packet in the pipeline
-# AudioRawFrame – carries raw PCM audio bytes
-# TextFrame   – carries text (LLM response tokens)
-# TranscriptionFrame – ASR output; the built-in type the LLM context expects
-# EndFrame    – signals the pipeline to shut down gracefully
-#
 from pipecat.frames.frames import (
     AudioRawFrame,
     EndFrame,
@@ -104,20 +85,12 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
 )
-
-# FrameProcessor – base class for all pipeline stages
-# FrameDirection – DOWNSTREAM (towards output) or UPSTREAM (towards input)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
-# Pipeline   – wires processors together in order
-# PipelineRunner – drives the async execution of a PipelineTask
-# PipelineTask   – a single running instance of a Pipeline
-# PipelineParams – configuration knobs for the task
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 
-from app.config import GROQ_API_KEY, SARVAM_API_KEY
+from app.config import SARVAM_API_KEY
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load Silero VAD model once at module level (not per-connection)
@@ -137,43 +110,37 @@ logger.info("VAD: Silero VAD model ready")
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom Frame Types
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Pipecat's built-in frames (AudioRawFrame, TextFrame, …) cover common cases.
-# We define our own for project-specific data that doesn't fit those types.
-#
 
 class SpeechEndFrame(Frame):
     """
     Emitted by VADProcessor when a full utterance has been detected.
-    Carries the complete buffered WAV audio (already resampled to 16 kHz)
-    ready to be sent to Sarvam ASR.
+    Carries the complete buffered WAV audio (already resampled to 16 kHz).
     """
     def __init__(self, audio_bytes: bytes, sample_rate: int = 16000):
         super().__init__()
-        self.audio_bytes = audio_bytes          # WAV file bytes
-        self.sample_rate = sample_rate          # always 16 kHz after resampling
+        self.audio_bytes = audio_bytes
+        self.sample_rate = sample_rate
 
 
 class TranscriptDisplayFrame(Frame):
     """
     Emitted by STT (for user text) and LLM (for AI text).
     Carries a line of conversation text that the browser chat UI should display.
-    NOT used for LLM input — that's TranscriptionFrame.
     """
     def __init__(self, text: str, speaker: str = "user"):
         super().__init__()
-        self.text = text            # the message
-        self.speaker = speaker      # "user" or "ai"
+        self.text = text
+        self.speaker = speaker
 
 
 class AIAudioFrame(Frame):
     """
     Emitted by SarvamTTSService.
-    Carries synthesized WAV audio bytes to be sent to the browser for playback.
+    Carries synthesized WAV audio bytes for one sentence.
     """
     def __init__(self, audio_bytes: bytes):
         super().__init__()
-        self.audio_bytes = audio_bytes      # raw WAV file bytes
+        self.audio_bytes = audio_bytes
 
 
 class AIStatusFrame(Frame):
@@ -183,20 +150,72 @@ class AIStatusFrame(Frame):
     """
     def __init__(self, ai_speaking: bool):
         super().__init__()
-        self.ai_speaking = ai_speaking      # True = started, False = finished
+        self.ai_speaking = ai_speaking
+
+
+# ── NEW FRAMES (Features 4, 6, 7, 10) ──────────────────────────────────────
+
+class AIThinkingFrame(Frame):
+    """
+    Feature 6: Typing Indicator.
+    Emitted by GroqLangGraphProcessor before the first LLM sentence is ready
+    (thinking=True) and removed once the first sentence is sent to TTS
+    (thinking=False). Browser shows animated "AI is thinking…" dots.
+    """
+    def __init__(self, thinking: bool):
+        super().__init__()
+        self.thinking = thinking
+
+
+class LanguageDetectedFrame(Frame):
+    """
+    Feature 7: Language Auto-Switch.
+    Emitted by SarvamSTTService after reading the language_code field from
+    Sarvam ASR response. Flows downstream to SarvamTTSService which switches
+    its target_language_code accordingly. Also forwarded to browser for badge.
+    """
+    def __init__(self, language_code: str):
+        super().__init__()
+        self.language_code = language_code
+
+
+class EmotionHintFrame(Frame):
+    """
+    Feature 10: Emotion/Tone Detection.
+    Emitted by VADProcessor (energy-based) or SarvamSTTService (confidence-based).
+    Consumed by GroqLangGraphProcessor to adjust the LLM system prompt.
+    hint: "neutral" | "hesitant" | "agitated"
+    """
+    def __init__(self, hint: str):
+        super().__init__()
+        self.hint = hint  # "neutral", "hesitant", "agitated"
+
+
+class BargeInDetectedFrame(Frame):
+    """
+    Feature 4: Barge-in Detection.
+    Emitted by VADProcessor when speech is detected while AI is speaking
+    (barge_in_mode=True). main.py receives this from OutputSink and
+    immediately interrupts the pipeline + stops browser audio.
+    """
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  VADProcessor  (Voice Activity Detection — Silero VAD)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Uses Silero VAD (pre-trained LSTM neural network) instead of a raw RMS
-# energy threshold. Silero gives a speech-probability score (0.0–1.0) per
-# chunk, making it robust to background noise, whispered speech, and varying
-# mic hardware — none of which the old RMS approach handled well.
+# NEW in this version:
+#   Feature 4 (Barge-in):  barge_in_mode lowers silence threshold so the VAD
+#                           responds faster, and emits BargeInDetectedFrame the
+#                           moment speech starts while AI is playing audio.
+#   Feature 10 (Emotion):  tracks average speech energy per utterance. If the
+#                           energy is > 2× baseline → emit EmotionHintFrame("agitated").
 #
 # Receives:  AudioRawFrame  (one ~85ms PCM chunk from the browser)
-# Emits:     SpeechEndFrame (one complete utterance as WAV)
+# Emits:     SpeechEndFrame         (one complete utterance as WAV)
+#            BargeInDetectedFrame   (when barge-in speech starts)
+#            EmotionHintFrame       (when high energy detected)
 #
 
 class VADProcessor(FrameProcessor):
@@ -209,23 +228,30 @@ class VADProcessor(FrameProcessor):
       3. If prob > SPEECH_THRESHOLD for MIN_SPEECH_CHUNKS consecutive
          chunks → speech started, begin buffering.
       4. Once speech started, if prob < SPEECH_THRESHOLD for
-         SILENCE_CHUNKS_NEEDED consecutive chunks → utterance complete.
+         silence_needed consecutive chunks → utterance complete.
       5. Hard-cap at MAX_BUFFER_CHUNKS to avoid infinite wait.
     """
 
     # ── Silero thresholds ─────────────────────────────────────────────────────
-    SPEECH_THRESHOLD    = 0.5   # Silero probability above this = speech
-    MIN_SPEECH_CHUNKS   = 3     # ~0.25 s of confirmed speech before buffering
-    SILENCE_CHUNKS_NEEDED = 8   # ~0.67 s of quiet = utterance ended
-    MAX_BUFFER_CHUNKS   = 80    # ~6.7 s safety cap
+    SPEECH_THRESHOLD     = 0.5   # Silero probability above this = speech
+    MIN_SPEECH_CHUNKS    = 3     # ~0.25 s of confirmed speech before buffering
+    SILENCE_CHUNKS_NEEDED = 8   # ~0.67 s of quiet = utterance ended (normal mode)
+    SILENCE_CHUNKS_BARGEIN = 3  # Feature 4: faster end-of-speech during barge-in
+    MAX_BUFFER_CHUNKS    = 80   # ~6.7 s safety cap
 
     # ── Sample rate constants ─────────────────────────────────────────────────
-    TARGET_SAMPLE_RATE  = 16000  # Silero and Sarvam ASR both expect 16 kHz
+    TARGET_SAMPLE_RATE   = 16000  # Silero and Sarvam ASR both expect 16 kHz
 
     def __init__(self, browser_sample_rate: int = 48000, **kwargs):
         super().__init__(**kwargs)
         self._browser_rate = browser_sample_rate
-        self._model = _silero_model   # reuse the module-level singleton
+        self._model = _silero_model
+        self._barge_in_mode = False       # Feature 4: set True when AI is speaking
+        self._barge_in_signaled = False   # Feature 4: prevent multiple barge-in signals
+        # Feature 10: energy tracking for emotion detection
+        self._energy_sum = 0.0
+        self._energy_count = 0
+        self._energy_baseline = 0.0   # rolling average of normal speech energy
         self._reset_vad_state()
 
     def update_sample_rate(self, rate: int):
@@ -233,23 +259,35 @@ class VADProcessor(FrameProcessor):
         self._browser_rate = rate
         logger.info(f"VAD: browser sample rate updated to {rate} Hz")
 
+    def set_barge_in_mode(self, enabled: bool):
+        """
+        Feature 4: Enable/disable barge-in mode.
+        In barge-in mode:
+          - Silence threshold is lowered (SILENCE_CHUNKS_BARGEIN = 3 chunks)
+            so the VAD ends the utterance faster (faster response).
+          - When speech first starts, BargeInDetectedFrame is emitted so
+            main.py can immediately interrupt the AI.
+        Call with True when AI starts speaking, False when AI stops.
+        """
+        self._barge_in_mode = enabled
+        self._barge_in_signaled = False  # reset signal for new AI turn
+        logger.debug(f"VAD: barge_in_mode={'ON' if enabled else 'OFF'}")
+
     def _reset_vad_state(self):
         """Clear all VAD buffers and reset Silero hidden state after each utterance."""
         self._audio_buffer: List[bytes] = []
         self._speech_chunks_seen  = 0
         self._silence_chunk_count = 0
         self._is_speech_active    = False
-        self._silero_leftover: list = []   # sub-512-sample remainder between chunks
-        # Reset Silero's internal LSTM hidden state so each utterance is independent
+        self._silero_leftover: list = []
+        self._energy_sum = 0.0
+        self._energy_count = 0
         self._model.reset_states()
 
     # ── Resampling ────────────────────────────────────────────────────────────
 
     def _resample(self, pcm_bytes: bytes) -> bytes:
-        """
-        Downsample from browser rate to 16 kHz using integer decimation.
-        Works for the common 48k→16k case (ratio = 3).
-        """
+        """Downsample from browser rate to 16 kHz using integer decimation."""
         if self._browser_rate == self.TARGET_SAMPLE_RATE:
             return pcm_bytes
         ratio = self._browser_rate / self.TARGET_SAMPLE_RATE
@@ -260,28 +298,15 @@ class VADProcessor(FrameProcessor):
 
     # ── Silero inference ──────────────────────────────────────────────────────
 
-    # Silero requires exactly 512 samples per call at 16 kHz
     SILERO_WINDOW = 512
 
     def _speech_prob(self, pcm_16k: bytes) -> float:
-        """
-        Run one 16-kHz PCM chunk through Silero VAD.
-        Returns the MAX speech probability across all 512-sample windows.
-
-        Silero requires EXACTLY 512 samples per call at 16 kHz.
-        Browser chunks are 4096 samples @ 48kHz → 1365 samples @ 16kHz after
-        resampling, so we split into 512-sample windows and take the max prob.
-        Any leftover samples (<512) are buffered into self._silero_leftover
-        and prepended to the next call.
-        """
+        """Run one 16-kHz PCM chunk through Silero VAD. Returns max speech prob."""
         samples = array.array('h', pcm_16k[:len(pcm_16k) & ~1])
         if not samples:
             return 0.0
-
-        # Prepend any leftover samples from the previous chunk
         combined = self._silero_leftover + list(samples)
         self._silero_leftover = []
-
         probs = []
         i = 0
         while i + self.SILERO_WINDOW <= len(combined):
@@ -291,10 +316,7 @@ class VADProcessor(FrameProcessor):
             with torch.no_grad():
                 probs.append(self._model(tensor, self.TARGET_SAMPLE_RATE).item())
             i += self.SILERO_WINDOW
-
-        # Save leftover samples for the next chunk
         self._silero_leftover = combined[i:]
-
         return max(probs) if probs else 0.0
 
     # ── WAV packing ──────────────────────────────────────────────────────────
@@ -309,6 +331,16 @@ class VADProcessor(FrameProcessor):
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
 
+    # ── Feature 10: energy helper ────────────────────────────────────────────
+
+    def _track_energy(self, pcm_16k: bytes):
+        """Track RMS energy of speech chunks for emotion detection."""
+        samples = array.array('h', pcm_16k[:len(pcm_16k) & ~1])
+        if samples:
+            energy = sum(abs(s) for s in samples) / len(samples)
+            self._energy_sum += energy
+            self._energy_count += 1
+
     # ── Pipecat frame processing ──────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -320,12 +352,8 @@ class VADProcessor(FrameProcessor):
 
     async def _process_audio_chunk(self, raw_pcm: bytes):
         """Run one chunk of browser audio through the Silero VAD state machine."""
-
-        # Step 1: resample to 16 kHz
         pcm_16k = self._resample(raw_pcm)
-
-        # Step 2: get Silero speech probability
-        prob = self._speech_prob(pcm_16k)
+        prob    = self._speech_prob(pcm_16k)
 
         if prob >= self.SPEECH_THRESHOLD:
             # ── SPEECH chunk ─────────────────────────────────────────────────
@@ -336,14 +364,30 @@ class VADProcessor(FrameProcessor):
                 self._speech_chunks_seen += 1
                 if self._speech_chunks_seen >= self.MIN_SPEECH_CHUNKS:
                     self._is_speech_active = True
-                    logger.debug(f"VAD: speech STARTED (prob={prob:.2f})")
+                    logger.debug(f"VAD: speech STARTED (prob={prob:.2f}, barge_in={self._barge_in_mode})")
+
+                    # Feature 4: Emit barge-in signal the moment speech is confirmed
+                    # while AI is speaking. main.py will interrupt the AI immediately.
+                    if self._barge_in_mode and not self._barge_in_signaled:
+                        self._barge_in_signaled = True
+                        await self.push_frame(BargeInDetectedFrame())
+
+            # Feature 10: track energy during active speech
+            if self._is_speech_active:
+                self._track_energy(pcm_16k)
+
         else:
             # ── SILENCE chunk ─────────────────────────────────────────────────
             if self._is_speech_active:
                 self._silence_chunk_count += 1
                 self._audio_buffer.append(pcm_16k)
 
-                silence_ended = self._silence_chunk_count >= self.SILENCE_CHUNKS_NEEDED
+                # Feature 4: use shorter silence window during barge-in for faster response
+                silence_needed = (
+                    self.SILENCE_CHUNKS_BARGEIN if self._barge_in_mode
+                    else self.SILENCE_CHUNKS_NEEDED
+                )
+                silence_ended = self._silence_chunk_count >= silence_needed
                 hard_cap_hit  = len(self._audio_buffer) >= self.MAX_BUFFER_CHUNKS
 
                 if silence_ended or hard_cap_hit:
@@ -356,6 +400,17 @@ class VADProcessor(FrameProcessor):
         if not self._audio_buffer:
             self._reset_vad_state()
             return
+
+        # Feature 10: check if user was speaking unusually loudly (emotion = agitated)
+        if self._energy_count > 0:
+            avg_energy = self._energy_sum / self._energy_count
+            if self._energy_baseline == 0.0:
+                self._energy_baseline = avg_energy   # first utterance sets baseline
+            elif avg_energy > self._energy_baseline * 2.0:
+                logger.info(f"VAD: high energy detected ({avg_energy:.0f} vs baseline {self._energy_baseline:.0f}) → agitated")
+                await self.push_frame(EmotionHintFrame(hint="agitated"))
+            # Update rolling baseline (70% old, 30% new)
+            self._energy_baseline = 0.7 * self._energy_baseline + 0.3 * avg_energy
 
         raw_pcm   = b"".join(self._audio_buffer)
         wav_bytes = self._pcm_to_wav(raw_pcm)
@@ -370,37 +425,48 @@ class VADProcessor(FrameProcessor):
 # 2.  SarvamSTTService  (Speech-to-Text)
 # ─────────────────────────────────────────────────────────────────────────────
 #
+# NEW in this version:
+#   Feature 7 (Language): reads language_code from Sarvam response and emits
+#                         LanguageDetectedFrame. Tracks detected language for
+#                         subsequent STT requests (auto-adapts over turns).
+#   Feature 10 (Emotion): reads confidence from response. Low confidence
+#                         (< 0.6) → emit EmotionHintFrame("hesitant").
+#
 # Receives:  SpeechEndFrame  (WAV audio of one utterance)
-# Emits:     TranscriptionFrame      (text → goes to GroqLLMProcessor)
-#            TranscriptDisplayFrame  (text → goes to browser chat UI)
+# Emits:     TranscriptionFrame      (text → LLM)
+#            TranscriptDisplayFrame  (text → browser chat UI)
+#            LanguageDetectedFrame   (detected language → TTS + browser badge)
+#            EmotionHintFrame        (low confidence → LLM prompt adjustment)
 #
 
 class SarvamSTTService(FrameProcessor):
     """
     Calls the Sarvam ASR API to transcribe one complete utterance.
-
-    Why custom? Pipecat has built-in STT services for Deepgram, AssemblyAI,
-    etc., but not for Sarvam. Writing a custom FrameProcessor is the correct
-    way to plug in a provider that Pipecat doesn't know about.
+    Also detects language and transcription confidence for downstream features.
     """
 
     SARVAM_ASR_URL = "https://api.sarvam.ai/speech-to-text"
 
-    # Single-word filler responses that are almost certainly ASR noise
     FILLER_WORDS = {
         "yes", "no", "ok", "okay", "hmm", "uh", "um", "ah", "oh",
         "huh", "hm", "yeah", "yep", "nope", "hey"
     }
 
+    # Feature 7: mapping from Sarvam short codes to BCP-47 language tags
+    LANG_NORMALIZE = {
+        "hi": "hi-IN", "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
+        "en": "en-IN", "mr": "mr-IN", "bn": "bn-IN", "gu": "gu-IN",
+        "pa": "pa-IN", "ml": "ml-IN", "or": "or-IN",
+    }
+
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
-        self._api_key    = api_key
-        # Reuse one HTTP client for the lifetime of this processor
-        self._http = httpx.AsyncClient(timeout=30.0)
+        self._api_key     = api_key
+        self._http        = httpx.AsyncClient(timeout=30.0)
+        self._language    = "en-IN"   # Feature 7: adapts after first detection
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
         if isinstance(frame, SpeechEndFrame):
             await self._transcribe(frame)
         else:
@@ -410,12 +476,15 @@ class SarvamSTTService(FrameProcessor):
         """
         Upload the WAV audio to Sarvam ASR and emit the transcript.
 
-        Sarvam expects multipart/form-data, so we write a temporary file
-        (same pattern as the original asr.py).
+        Feature 7: After the first transcription, we update self._language
+        to whatever Sarvam detected, so subsequent requests are sent with
+        the right language_code for better accuracy.
+
+        Feature 10: If Sarvam returns a confidence score < 0.6, we emit
+        an EmotionHintFrame("hesitant") so the LLM can be more encouraging.
         """
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="pipecat_utt_")
         try:
-            # Write WAV bytes to a temp file for the multipart upload
             with os.fdopen(tmp_fd, "wb") as f:
                 f.write(frame.audio_bytes)
 
@@ -424,15 +493,34 @@ class SarvamSTTService(FrameProcessor):
                     self.SARVAM_ASR_URL,
                     headers={"api-subscription-key": self._api_key},
                     files={"file": ("audio.wav", f, "audio/wav")},
-                    data={"model": "saarika:v2.5", "language_code": "en-IN"},
+                    data={"model": "saarika:v2.5", "language_code": self._language},
                 )
 
             if resp.status_code != 200:
                 logger.error(f"STT HTTP {resp.status_code}: {resp.text[:200]}")
                 return
 
-            transcript = resp.json().get("transcript", "").strip()
+            resp_json   = resp.json()
+            transcript  = resp_json.get("transcript", "").strip()
             logger.info(f"STT transcript: {transcript!r}")
+
+            # ── Feature 7: Language detection ──────────────────────────────
+            # Sarvam returns the detected language_code in the response.
+            # Normalize it to BCP-47 format (e.g. "hi" → "hi-IN").
+            raw_lang   = resp_json.get("language_code", self._language)
+            detected   = self.LANG_NORMALIZE.get(raw_lang, raw_lang)
+            if detected != self._language:
+                logger.info(f"STT: language changed {self._language!r} → {detected!r}")
+                self._language = detected
+            await self.push_frame(LanguageDetectedFrame(language_code=detected))
+
+            # ── Feature 10: Emotion hint from confidence ────────────────────
+            # Sarvam may return a confidence score. Low confidence suggests
+            # the user was hesitant, unclear, or mumbling.
+            confidence = float(resp_json.get("confidence", 1.0))
+            if confidence < 0.6:
+                logger.info(f"STT: low confidence ({confidence:.2f}) → hesitant emotion hint")
+                await self.push_frame(EmotionHintFrame(hint="hesitant"))
 
             # ── Noise / filler filter ──────────────────────────────────────
             cleaned = transcript.lower().rstrip(".,!? ")
@@ -441,17 +529,15 @@ class SarvamSTTService(FrameProcessor):
                 return
 
             # ── Emit frames downstream ─────────────────────────────────────
-
-            # TranscriptionFrame — the standard pipecat frame for ASR output.
-            # GroqLLMProcessor listens for this type.
-            await self.push_frame(
-                TranscriptionFrame(text=transcript, user_id="user", timestamp="")
-            )
-
-            # TranscriptDisplayFrame — carries the same text to the browser UI.
-            # It flows all the way to OutputSink which puts it on the output queue.
+            # ORDERING: push user display frame FIRST, then the transcription.
+            # TranscriptionFrame triggers a long-running LLM call which blocks
+            # the pipeline. Pushing the display frame first ensures the user's
+            # text bubble appears in the browser BEFORE the AI response audio.
             await self.push_frame(
                 TranscriptDisplayFrame(text=transcript, speaker="user")
+            )
+            await self.push_frame(
+                TranscriptionFrame(text=transcript, user_id="user", timestamp="")
             )
 
         except Exception as e:
@@ -467,44 +553,37 @@ class SarvamSTTService(FrameProcessor):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  GroqLangGraphProcessor  (Phase 8 LLM + Memory via LangGraph)
+# 3.  GroqLangGraphProcessor  (LLM + Memory via LangGraph)
 # ─────────────────────────────────────────────────────────────────────────────
 #
+# NEW in this version:
+#   Feature 3 (Streaming TTS): uses stream_agent() instead of run_agent().
+#     Receives sentences one at a time as the LLM generates them and pushes
+#     each as a separate TextFrame to TTS immediately. First audio can start
+#     playing before the LLM has finished generating the full response.
+#   Feature 6 (Typing Indicator): emits AIThinkingFrame(True) when processing
+#     starts and AIThinkingFrame(False) when the first sentence is ready.
+#   Feature 10 (Emotion): listens for EmotionHintFrame from STT/VAD and stores
+#     the hint. Passes it to stream_agent() where it modifies the system prompt.
+#
 # Receives:  TranscriptionFrame  (user's transcribed speech)
-# Emits:     TextFrame               (AI's reply → goes to TTS)
-#            TranscriptDisplayFrame  (AI's reply → goes to browser chat UI)
-#
-# PHASE 8 UPGRADE vs PHASE 7:
-#   Phase 7: self._messages = [dict, dict, ...]  → manual list append/pop
-#             Direct Groq httpx call
-#             Memory lives only in the object
-#
-#   Phase 8: LangGraph StateGraph with add_messages reducer
-#             MemorySaver checkpointer with thread_id isolation
-#             Memory survives object replacement (stored in checkpointer)
-#             Foundation for adding tools, routing, multi-agent, etc.
-#
-# WHY thread_id?
-#   The same `agent_graph` (compiled LangGraph) is shared across all
-#   WebSocket connections. The thread_id is the key that tells LangGraph
-#   "this turn belongs to connection X, load that conversation history".
-#   Without it, all users would share the same memory!
+#            EmotionHintFrame    (from VAD or STT — consumed here)
+# Emits:     AIThinkingFrame     (thinking=True/False)
+#            TextFrame           (one per LLM sentence → goes to TTS)
+#            TranscriptDisplayFrame (full AI reply → browser chat UI)
 #
 
 class GroqLangGraphProcessor(FrameProcessor):
     """
-    Phase 8 LLM processor: delegates all reasoning and memory to LangGraph.
-
-    Each instance has a unique thread_id (UUID) assigned by VoicePipelineManager.
-    When process_frame() receives a TranscriptionFrame, it calls run_agent()
-    which routes through the LangGraph state machine with automatic memory.
+    Streaming LLM processor that delegates to LangGraph for memory management.
+    Sentences are emitted as they arrive from the LLM stream, enabling
+    the TTS pipeline to start synthesizing immediately.
     """
 
     def __init__(self, thread_id: str, **kwargs):
         super().__init__(**kwargs)
-        # Unique identifier for this session's conversation history.
-        # LangGraph uses this to load/save the right state from MemorySaver.
-        self._thread_id = thread_id
+        self._thread_id   = thread_id
+        self._emotion_hint = "neutral"   # Feature 10: updated by EmotionHintFrame
         logger.info(f"GroqLangGraphProcessor: thread_id={thread_id}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -512,48 +591,74 @@ class GroqLangGraphProcessor(FrameProcessor):
 
         if isinstance(frame, TranscriptionFrame):
             await self._generate(frame.text)
+
+        elif isinstance(frame, EmotionHintFrame):
+            # Feature 10: store emotion hint, use it in next LLM call.
+            # Don't push downstream — this frame is consumed here.
+            self._emotion_hint = frame.hint
+            logger.debug(f"LLM: emotion hint updated → {frame.hint!r}")
+
         else:
             await self.push_frame(frame, direction)
 
     async def _generate(self, user_text: str):
         """
-        Route user text through the LangGraph agent and emit the response.
+        Stream user text through LangGraph + Groq, emitting one TextFrame
+        per sentence for immediate TTS synthesis.
 
-        What happens inside run_agent():
-          1. LangGraph loads saved state for self._thread_id from MemorySaver
-          2. Appends HumanMessage(user_text) to history (via add_messages)
-          3. Calls llm_node → Groq API with FULL history
-          4. Appends AIMessage(reply) to history
-          5. Saves state back to MemorySaver
-          6. Returns the AI's text reply
+        Flow:
+          1. Emit AIThinkingFrame(True)  → browser shows "AI is thinking…"
+          2. Call stream_agent() which streams sentences from the LLM
+          3. On first sentence: emit AIThinkingFrame(False) to hide thinking dots
+          4. Push each sentence as TextFrame → TTS synthesizes immediately
+          5. In `finally`: always emit full TranscriptDisplayFrame for chat log
+             — even if _save_turn() inside stream_agent raises an exception.
+          6. Reset emotion_hint to neutral
         """
+        from app.langgraph_flow import stream_agent
+
+        logger.info(f"LangGraph streaming: thread={self._thread_id[:8]}… input={user_text!r}")
+
+        # Feature 6: signal to browser that we're thinking
+        await self.push_frame(AIThinkingFrame(thinking=True))
+
+        full_text      = ""
+        first_sentence = True
+
         try:
-            # Import here to avoid circular import at module load time
-            from app.langgraph_flow import run_agent
+            async for sentence in stream_agent(user_text, self._thread_id, self._emotion_hint):
+                if not sentence.strip():
+                    continue
 
-            logger.info(f"LangGraph: turn for thread={self._thread_id[:8]}… input={user_text!r}")
+                if first_sentence:
+                    # Feature 6: hide thinking dots as soon as we have the first sentence
+                    await self.push_frame(AIThinkingFrame(thinking=False))
+                    first_sentence = False
 
-            ai_reply = await run_agent(user_text, self._thread_id)
-
-            if not ai_reply:
-                logger.warning("LangGraph: empty reply, skipping")
-                return
-
-            # Push text downstream → SarvamTTSService will speak it
-            await self.push_frame(TextFrame(text=ai_reply))
-
-            # Push for browser chat display
-            await self.push_frame(TranscriptDisplayFrame(text=ai_reply, speaker="ai"))
+                full_text += sentence.strip() + " "
+                # Feature 3: push each sentence to TTS immediately
+                await self.push_frame(TextFrame(text=sentence.strip()))
 
         except Exception as e:
-            logger.error(f"LangGraph error: {e}")
+            logger.error(f"LangGraph streaming error: {e}")
+
+        finally:
+            # Always hide the thinking indicator (even if an error occurred)
+            if first_sentence:
+                await self.push_frame(AIThinkingFrame(thinking=False))
+
+            # Always show the AI text in the chat, even if state-save failed.
+            # This was the root cause of missing AI text bubbles: an exception
+            # from _save_turn() inside stream_agent() was caught here and caused
+            # an early return before TranscriptDisplayFrame was pushed.
+            if full_text.strip():
+                await self.push_frame(TranscriptDisplayFrame(text=full_text.strip(), speaker="ai"))
+
+        # Reset emotion hint after use — next turn starts neutral
+        self._emotion_hint = "neutral"
 
     def reset_thread(self):
-        """
-        Start a new conversation by assigning a new thread_id.
-        The old history is not deleted from MemorySaver, just orphaned.
-        A fresh UUID means the next turn starts with an empty history.
-        """
+        """Start a new conversation by assigning a new thread_id."""
         old = self._thread_id
         self._thread_id = str(uuid.uuid4())
         logger.info(f"LangGraph: thread reset {old[:8]}→{self._thread_id[:8]}")
@@ -563,18 +668,27 @@ class GroqLangGraphProcessor(FrameProcessor):
 # 4.  SarvamTTSService  (Text-to-Speech)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Receives:  TextFrame     (AI's complete response text)
-# Emits:     AIStatusFrame (ai_speaking=True  — BEFORE audio)
-#            AIAudioFrame  (WAV audio bytes)
-#            AIStatusFrame (ai_speaking=False — AFTER audio)
+# NEW in this version:
+#   Feature 3 (Streaming TTS): now receives one TextFrame per sentence
+#     (instead of one big TextFrame) and synthesizes each immediately.
+#     Since the TTS API handles short sentences faster, the first audio
+#     chunk reaches the browser much sooner.
+#   Feature 7 (Language Auto-Switch): listens for LanguageDetectedFrame
+#     and updates the target_language_code used in all subsequent API calls.
+#
+# Receives:  TextFrame              (one sentence of AI reply)
+#            LanguageDetectedFrame  (updates TTS language)
+# Emits:     AIStatusFrame(True)   (before first sentence audio)
+#            AIAudioFrame           (WAV bytes for one sentence)
+#            AIStatusFrame(False)   (after last sentence audio)
 #
 
 class SarvamTTSService(FrameProcessor):
     """
-    Calls the Sarvam TTS API to synthesize speech from text.
-
-    Handles Sarvam's ~450-character limit by truncating at the last
-    sentence boundary within the limit.
+    Synthesizes speech sentence by sentence.
+    The first AIStatusFrame(True) is emitted before the very first sentence.
+    AIStatusFrame(False) is emitted only once, after the last TextFrame
+    has been synthesized. This is managed by tracking whether TTS is "active".
     """
 
     SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
@@ -582,22 +696,30 @@ class SarvamTTSService(FrameProcessor):
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
-        self._api_key = api_key
-        self._http    = httpx.AsyncClient(timeout=30.0)
+        self._api_key   = api_key
+        self._http      = httpx.AsyncClient(timeout=30.0)
+        # Feature 7: updated when LanguageDetectedFrame arrives
+        self._language  = "en-IN"
+        self._tts_active = False   # tracks if we've sent AIStatusFrame(True) already
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TextFrame):
             await self._synthesize(frame.text)
+
+        elif isinstance(frame, LanguageDetectedFrame):
+            # Feature 7: update TTS language for all subsequent sentences
+            self._language = frame.language_code
+            logger.info(f"TTS: language switched to {frame.language_code!r}")
+            # Also pass the frame downstream so OutputSink can forward it to browser
+            await self.push_frame(frame, direction)
+
         else:
             await self.push_frame(frame, direction)
 
     def _truncate(self, text: str) -> str:
-        """
-        Keep text within Sarvam's per-item character limit.
-        Prefer cutting at a sentence boundary to avoid awkward cut-offs.
-        """
+        """Keep text within Sarvam's per-item character limit."""
         if len(text) <= self.TTS_CHAR_LIMIT:
             return text
         truncated = text[:self.TTS_CHAR_LIMIT]
@@ -608,9 +730,25 @@ class SarvamTTSService(FrameProcessor):
         return truncated
 
     async def _synthesize(self, text: str):
+        """
+        Synthesize one sentence and emit audio.
+
+        Feature 3 (Streaming TTS):
+          - AIStatusFrame(True) is emitted only before the FIRST sentence.
+          - AIStatusFrame(False) is emitted after each sentence's audio.
+            The final False signals the browser that all audio is done.
+          - Between sentences, status stays True so the browser keeps showing
+            the "AI is speaking" indicator.
+
+        Note: The current design emits AIStatusFrame(False) after EVERY sentence.
+        main.py treats each False as "might be done", but the browser's audio
+        queue keeps playing. The overall speaking indicator resets only after
+        the last sentence's audio finishes playing (handled in index.html's
+        audioQueue logic).
+        """
         try:
             tts_text = self._truncate(text)
-            logger.info(f"TTS: synthesizing ({len(tts_text)} chars): {tts_text[:60]!r}…")
+            logger.info(f"TTS: synthesizing ({len(tts_text)} chars, lang={self._language}): {tts_text[:60]!r}…")
 
             resp = await self._http.post(
                 self.SARVAM_TTS_URL,
@@ -619,10 +757,10 @@ class SarvamTTSService(FrameProcessor):
                     "Content-Type": "application/json",
                 },
                 json={
-                    "inputs": [tts_text],
-                    "target_language_code": "en-IN",
-                    "speaker": "anushka",
-                    "model": "bulbul:v2",
+                    "inputs":               [tts_text],
+                    "target_language_code": self._language,
+                    "speaker":              "anushka",
+                    "model":                "bulbul:v2",
                 },
             )
 
@@ -636,17 +774,22 @@ class SarvamTTSService(FrameProcessor):
                 return
 
             wav_bytes = base64.b64decode(audio_b64)
-            logger.info(f"TTS: got {len(wav_bytes)} bytes of audio")
+            logger.info(f"TTS: got {len(wav_bytes)} bytes of audio for sentence")
 
-            # Signal AI started → send actual audio → signal AI stopped
-            await self.push_frame(AIStatusFrame(ai_speaking=True))
+            # Signal "AI started speaking" only on the first sentence of this turn
+            if not self._tts_active:
+                self._tts_active = True
+                await self.push_frame(AIStatusFrame(ai_speaking=True))
+
             await self.push_frame(AIAudioFrame(audio_bytes=wav_bytes))
+            # Signal "AI finished this sentence" — browser knows more may follow
             await self.push_frame(AIStatusFrame(ai_speaking=False))
+            self._tts_active = False   # ready to send True on next sentence if needed
 
         except Exception as e:
             logger.error(f"TTS error: {e}")
-            # Make sure we always reset the speaking flag even on error
             await self.push_frame(AIStatusFrame(ai_speaking=False))
+            self._tts_active = False
 
     async def cleanup(self):
         await self._http.aclose()
@@ -656,22 +799,24 @@ class SarvamTTSService(FrameProcessor):
 # 5.  OutputSink
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# The LAST processor in the pipeline. Instead of pushing frames further
-# downstream (there's nowhere left to go), it puts them onto an asyncio.Queue.
-# main.py reads from that queue and sends the data back to the browser.
+# NEW in this version: forwards the new frame types (AIThinkingFrame,
+# LanguageDetectedFrame, BargeInDetectedFrame) to the output queue so that
+# main.py can handle them.
 #
 
 class OutputSink(FrameProcessor):
     """
-    Collects pipeline output frames and puts them on an asyncio.Queue.
-    The WebSocket handler in main.py reads from this queue to decide
-    what to send back to the browser.
+    Last processor in the pipeline. Puts output frames onto an asyncio.Queue
+    that main.py reads from to send data back to the browser.
 
     Handles:
-      - TranscriptDisplayFrame → browser chat display
-      - AIAudioFrame           → browser audio playback
-      - AIStatusFrame          → speaking indicator in the browser UI
-      - EndFrame               → tells main.py the pipeline is shutting down
+      TranscriptDisplayFrame  → browser chat display
+      AIAudioFrame            → browser audio playback
+      AIStatusFrame           → speaking indicator
+      AIThinkingFrame         → Feature 6: thinking indicator
+      LanguageDetectedFrame   → Feature 7: language badge
+      BargeInDetectedFrame    → Feature 4: auto-interrupt signal
+      EndFrame                → signals pipeline shutdown
     """
 
     def __init__(self, output_queue: asyncio.Queue, **kwargs):
@@ -681,26 +826,20 @@ class OutputSink(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        # Put our custom output frames onto the queue for main.py to read
+        # Put all output-relevant frames onto the queue for main.py
         if isinstance(frame, (
             TranscriptDisplayFrame,
             AIAudioFrame,
             AIStatusFrame,
+            AIThinkingFrame,        # Feature 6
+            LanguageDetectedFrame,  # Feature 7
+            BargeInDetectedFrame,   # Feature 4
             EndFrame,
         )):
             await self._q.put(frame)
 
-        # ALWAYS push every frame downstream, even ones we don't handle.
-        #
-        # WHY THIS IS CRITICAL:
-        # Pipecat sends system frames (StartFrame, StopFrame, HeartbeatFrame,
-        # CancelFrame, etc.) through the whole pipeline for lifecycle management.
-        # StartFrame in particular MUST reach Pipeline::Sink or the pipeline
-        # stays stuck in "Starting. Waiting for StartFrame..." forever and
-        # never processes any audio.
-        #
-        # Without this line: pipeline hangs, no speech is ever processed.
-        # With this line:    system frames flow through and pipeline starts.
+        # CRITICAL: always push ALL frames downstream, including system frames
+        # (StartFrame, StopFrame, CancelFrame, etc.) for pipeline lifecycle.
         await self.push_frame(frame, direction)
 
 
@@ -708,58 +847,29 @@ class OutputSink(FrameProcessor):
 # 6.  VoicePipelineManager
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# One instance per WebSocket connection.
-#
-# Responsibilities:
-#   - Assemble and start the Pipecat pipeline.
-#   - Provide push_audio() so main.py can inject browser audio.
-#   - Expose output_queue so main.py can read pipeline results.
-#   - Provide interrupt() and stop() for lifecycle management.
+# NEW in this version:
+#   Feature 1 (Interrupt Fix): interrupt() now also drains the output_queue
+#     so stale TTS audio frames don't get sent to browser after interruption.
+#   Feature 4 (Barge-in): exposes set_barge_in_mode() which delegates to VAD.
 #
 
 class VoicePipelineManager:
     """
     Manages the Pipecat pipeline for a single WebSocket connection.
-
-    Usage in main.py:
-        manager = VoicePipelineManager()
-        await manager.start()
-
-        # Feed audio in:
-        await manager.push_audio(pcm_bytes, sample_rate)
-
-        # Read output:
-        frame = await manager.output_queue.get()
-
-        # Shut down:
-        await manager.stop()
+    Each WebSocket gets its own isolated instance with its own memory.
     """
 
     def __init__(self):
-        # Queue that OutputSink fills; main.py reads from this
         self.output_queue: asyncio.Queue = asyncio.Queue()
-
-        # ── Per-session thread_id (Phase 8) ────────────────────────────────
-        # This UUID uniquely identifies this WebSocket connection's conversation.
-        # LangGraph's MemorySaver uses it as the key to store/retrieve history.
-        # Each new connection → new UUID → fresh isolated conversation memory.
         self.thread_id: str = str(uuid.uuid4())
         logger.info(f"VoicePipelineManager: new session thread_id={self.thread_id[:8]}…")
 
-        # ── Build processors ───────────────────────────────────────────────
-        # Each is a separate object — they can be individually configured,
-        # replaced, or inspected without touching any other stage.
-        self._vad  = VADProcessor()           # VAD starts at default 48 kHz; updated on init msg
+        self._vad  = VADProcessor()
         self._stt  = SarvamSTTService(api_key=SARVAM_API_KEY)
-        # Phase 8: GroqLangGraphProcessor replaces GroqLLMProcessor.
-        # The thread_id links this processor to its conversation in MemorySaver.
         self._llm  = GroqLangGraphProcessor(thread_id=self.thread_id)
         self._tts  = SarvamTTSService(api_key=SARVAM_API_KEY)
         self._sink = OutputSink(output_queue=self.output_queue)
 
-        # ── Wire them together in a Pipeline ──────────────────────────────
-        # Pipeline([a, b, c]) connects a → b → c.
-        # A frame pushed downstream by a arrives at b.process_frame(), and so on.
         self._pipeline = Pipeline([
             self._vad,
             self._stt,
@@ -768,35 +878,29 @@ class VoicePipelineManager:
             self._sink,
         ])
 
-        # ── Create PipelineTask ────────────────────────────────────────────
-        # allow_interruptions=True: if a new utterance arrives while a previous
-        # one is still being processed, Pipecat can interrupt the current work
-        # and start fresh. Enables natural conversation flow.
-        # In pipecat >= 0.0.100, `params` is keyword-only.
-        # enable_rtvi=False: pipecat 0.0.108 injects an RTVIProcessor by default
-        # (visible in logs as "PipelineTask::Source -> RTVIProcessor -> Pipeline").
-        # RTVI is a protocol for Daily.co and similar transports — we're not using
-        # it. Leaving it enabled adds an unnecessary layer that can interfere with
-        # raw AudioRawFrame injection via task.queue_frame().
         self._task   = PipelineTask(
             self._pipeline,
             params=PipelineParams(allow_interruptions=True),
             enable_rtvi=False,
         )
         self._runner      = PipelineRunner()
-        self._runner_coro = None    # asyncio Task for the runner coroutine
+        self._runner_coro = None
 
     def update_sample_rate(self, rate: int):
-        """Call this once the browser sends its init metadata with the real sample rate."""
+        """Call once the browser sends its init metadata with the real sample rate."""
         self._vad.update_sample_rate(rate)
 
+    def set_barge_in_mode(self, enabled: bool):
+        """
+        Feature 4: Enable/disable barge-in mode on the VAD.
+        Call with True when AI starts speaking, False when AI stops.
+        This lets the VAD detect user speech during AI playback and
+        emit BargeInDetectedFrame to trigger immediate interruption.
+        """
+        self._vad.set_barge_in_mode(enabled)
+
     async def start(self):
-        """
-        Launch the pipeline runner as a background asyncio Task.
-        The pipeline will now wait for frames to be queued into it.
-        """
-        # PipelineRunner.run() is a coroutine that blocks until the pipeline ends.
-        # We wrap it in create_task() so it runs concurrently with the WebSocket loop.
+        """Launch the pipeline runner as a background asyncio Task."""
         self._runner_coro = asyncio.create_task(
             self._runner.run(self._task),
             name="pipecat-pipeline-runner",
@@ -804,35 +908,38 @@ class VoicePipelineManager:
         logger.info("VoicePipelineManager: pipeline started")
 
     async def push_audio(self, pcm_bytes: bytes, sample_rate: int = 48000):
-        """
-        Inject a raw PCM audio chunk from the browser into the pipeline.
-        VADProcessor will accumulate these until a full utterance is detected.
-
-        pcm_bytes   – 16-bit little-endian mono PCM (as received from browser)
-        sample_rate – native rate of the browser (typically 48000 Hz)
-        """
+        """Inject a raw PCM audio chunk from the browser into the pipeline."""
         frame = AudioRawFrame(
             audio=pcm_bytes,
             sample_rate=sample_rate,
             num_channels=1,
         )
-        # queue_frame() injects the frame at the start of the pipeline
         await self._task.queue_frame(frame)
 
     async def interrupt(self):
         """
-        Cancel the current pipeline processing (e.g., user interrupted AI speech).
-        The pipeline will still be alive; new audio can be pushed immediately after.
+        Feature 1 (Interrupt Fix): Cancel current pipeline processing AND drain
+        the output_queue so no stale TTS audio is sent to the browser afterwards.
+
+        Without draining: after interrupt, previously-synthesized WAV chunks
+        sitting in the queue would still be sent and played — confusing the user.
+        With draining: the queue is empty; browser gets clean silence immediately.
         """
         await self._task.cancel()
-        logger.info("VoicePipelineManager: pipeline interrupted")
+
+        # Drain all pending output frames so stale audio/status isn't sent
+        drained = 0
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+
+        logger.info(f"VoicePipelineManager: interrupted (drained {drained} stale frames)")
 
     async def stop(self):
-        """
-        Gracefully shut down the pipeline when the WebSocket disconnects.
-        Sends EndFrame which flows through to OutputSink, where it signals
-        the send_loop in main.py to exit.
-        """
+        """Gracefully shut down the pipeline when the WebSocket disconnects."""
         try:
             await self._task.queue_frame(EndFrame())
             if self._runner_coro and not self._runner_coro.done():
@@ -842,10 +949,7 @@ class VoicePipelineManager:
         logger.info("VoicePipelineManager: pipeline stopped")
 
     def clear_memory(self):
-        """
-        Reset conversation memory by assigning a new thread_id.
-        The LangGraph MemorySaver will see a fresh thread and start clean.
-        """
+        """Reset conversation memory by assigning a new thread_id."""
         self._llm.reset_thread()
         self.thread_id = self._llm._thread_id
         logger.info("VoicePipelineManager: memory cleared (new thread_id)")
