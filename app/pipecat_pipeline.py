@@ -79,6 +79,7 @@ import io
 import os
 import tempfile
 import time
+import torch
 import uuid
 import wave
 from typing import List, Optional
@@ -172,12 +173,13 @@ class AIStatusFrame(Frame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  VADProcessor  (Voice Activity Detection)
+# 1.  VADProcessor  (Voice Activity Detection — Silero VAD)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Replaces the raw VAD state machine that lived inside the Phase 6
-# WebSocket handler. Same algorithm, but now it's a self-contained
-# FrameProcessor that can be swapped out independently.
+# Uses Silero VAD (pre-trained LSTM neural network) instead of a raw RMS
+# energy threshold. Silero gives a speech-probability score (0.0–1.0) per
+# chunk, making it robust to background noise, whispered speech, and varying
+# mic hardware — none of which the old RMS approach handled well.
 #
 # Receives:  AudioRawFrame  (one ~85ms PCM chunk from the browser)
 # Emits:     SpeechEndFrame (one complete utterance as WAV)
@@ -185,32 +187,42 @@ class AIStatusFrame(Frame):
 
 class VADProcessor(FrameProcessor):
     """
-    Voice Activity Detection – detects when the user starts and stops speaking,
-    then emits a single SpeechEndFrame containing the full buffered utterance.
+    Voice Activity Detection using Silero VAD neural network.
 
-    Algorithm (same as Phase 6):
-      1. Compute RMS energy of each incoming PCM chunk.
-      2. If energy > SPEECH_RMS_THRESHOLD for MIN_SPEECH_CHUNKS consecutive
+    Algorithm:
+      1. Resample each incoming PCM chunk from browser rate → 16 kHz.
+      2. Run the chunk through Silero VAD → speech probability (0.0–1.0).
+      3. If prob > SPEECH_THRESHOLD for MIN_SPEECH_CHUNKS consecutive
          chunks → speech started, begin buffering.
-      3. Once speech started, if energy < SPEECH_RMS_THRESHOLD for
+      4. Once speech started, if prob < SPEECH_THRESHOLD for
          SILENCE_CHUNKS_NEEDED consecutive chunks → utterance complete.
-      4. Hard-cap at MAX_BUFFER_CHUNKS to avoid infinite wait.
+      5. Hard-cap at MAX_BUFFER_CHUNKS to avoid infinite wait.
     """
 
-    # ── Tunable thresholds (identical to Phase 6 values) ──────────────────────
-    SPEECH_RMS_THRESHOLD = 700      # below → silence; above → speech
-    MIN_SPEECH_CHUNKS    = 6        # need ~0.5 s of real speech before buffering
-    SILENCE_CHUNKS_NEEDED = 8       # ~0.67 s of quiet means utterance ended
-    MAX_BUFFER_CHUNKS    = 80       # ~6.7 s safety cap
+    # ── Silero thresholds ─────────────────────────────────────────────────────
+    SPEECH_THRESHOLD    = 0.5   # Silero probability above this = speech
+    MIN_SPEECH_CHUNKS   = 3     # ~0.25 s of confirmed speech before buffering
+    SILENCE_CHUNKS_NEEDED = 8   # ~0.67 s of quiet = utterance ended
+    MAX_BUFFER_CHUNKS   = 80    # ~6.7 s safety cap
 
     # ── Sample rate constants ─────────────────────────────────────────────────
-    TARGET_SAMPLE_RATE   = 16000    # Sarvam ASR expects 16 kHz
+    TARGET_SAMPLE_RATE  = 16000  # Silero and Sarvam ASR both expect 16 kHz
 
     def __init__(self, browser_sample_rate: int = 48000, **kwargs):
         super().__init__(**kwargs)
-        # The browser sends audio at its native rate (usually 48 kHz).
-        # We need to resample to 16 kHz before storing in the buffer.
         self._browser_rate = browser_sample_rate
+
+        # Load Silero VAD model (downloads ~1.5 MB once, then cached locally)
+        logger.info("VAD: loading Silero VAD model…")
+        self._model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            verbose=False,
+        )
+        self._model.eval()
+        logger.info("VAD: Silero VAD model ready")
+
         self._reset_vad_state()
 
     def update_sample_rate(self, rate: int):
@@ -219,53 +231,77 @@ class VADProcessor(FrameProcessor):
         logger.info(f"VAD: browser sample rate updated to {rate} Hz")
 
     def _reset_vad_state(self):
-        """Clear all VAD buffers after emitting an utterance."""
-        self._audio_buffer: List[bytes] = []    # resampled 16-kHz PCM chunks
+        """Clear all VAD buffers and reset Silero hidden state after each utterance."""
+        self._audio_buffer: List[bytes] = []
         self._speech_chunks_seen  = 0
         self._silence_chunk_count = 0
         self._is_speech_active    = False
-
-    # ── RMS calculation ───────────────────────────────────────────────────────
-
-    def _rms(self, pcm_bytes: bytes) -> float:
-        """
-        Root Mean Square of 16-bit signed little-endian PCM data.
-        Higher value = louder audio. Used to classify speech vs. silence.
-        """
-        if len(pcm_bytes) < 2:
-            return 0.0
-        # Unpack raw bytes as signed 16-bit integers
-        samples = array.array('h', pcm_bytes[:len(pcm_bytes) & ~1])
-        if not samples:
-            return 0.0
-        return (sum(s * s for s in samples) / len(samples)) ** 0.5
+        self._silero_leftover: list = []   # sub-512-sample remainder between chunks
+        # Reset Silero's internal LSTM hidden state so each utterance is independent
+        self._model.reset_states()
 
     # ── Resampling ────────────────────────────────────────────────────────────
 
     def _resample(self, pcm_bytes: bytes) -> bytes:
         """
-        Downsample from browser rate to 16 kHz using simple decimation.
-        Works correctly when the ratio is an integer (48k/16k = 3).
+        Downsample from browser rate to 16 kHz using integer decimation.
+        Works for the common 48k→16k case (ratio = 3).
         """
         if self._browser_rate == self.TARGET_SAMPLE_RATE:
             return pcm_bytes
-        ratio = self._browser_rate / self.TARGET_SAMPLE_RATE   # e.g. 3.0
+        ratio = self._browser_rate / self.TARGET_SAMPLE_RATE
         samples = array.array('h', pcm_bytes[:len(pcm_bytes) & ~1])
         out_len = int(len(samples) / ratio)
         out = array.array('h', (samples[int(i * ratio)] for i in range(out_len)))
         return out.tobytes()
 
+    # ── Silero inference ──────────────────────────────────────────────────────
+
+    # Silero requires exactly 512 samples per call at 16 kHz
+    SILERO_WINDOW = 512
+
+    def _speech_prob(self, pcm_16k: bytes) -> float:
+        """
+        Run one 16-kHz PCM chunk through Silero VAD.
+        Returns the MAX speech probability across all 512-sample windows.
+
+        Silero requires EXACTLY 512 samples per call at 16 kHz.
+        Browser chunks are 4096 samples @ 48kHz → 1365 samples @ 16kHz after
+        resampling, so we split into 512-sample windows and take the max prob.
+        Any leftover samples (<512) are buffered into self._silero_leftover
+        and prepended to the next call.
+        """
+        samples = array.array('h', pcm_16k[:len(pcm_16k) & ~1])
+        if not samples:
+            return 0.0
+
+        # Prepend any leftover samples from the previous chunk
+        combined = self._silero_leftover + list(samples)
+        self._silero_leftover = []
+
+        probs = []
+        i = 0
+        while i + self.SILERO_WINDOW <= len(combined):
+            window = combined[i: i + self.SILERO_WINDOW]
+            float_win = [s / 32768.0 for s in window]
+            tensor = torch.tensor(float_win, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                probs.append(self._model(tensor, self.TARGET_SAMPLE_RATE).item())
+            i += self.SILERO_WINDOW
+
+        # Save leftover samples for the next chunk
+        self._silero_leftover = combined[i:]
+
+        return max(probs) if probs else 0.0
+
     # ── WAV packing ──────────────────────────────────────────────────────────
 
     def _pcm_to_wav(self, pcm_bytes: bytes) -> bytes:
-        """
-        Wrap raw PCM bytes in a WAV header.
-        Sarvam ASR expects a proper WAV file, not bare PCM.
-        """
+        """Wrap raw 16-kHz PCM bytes in a WAV header for Sarvam ASR."""
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)          # mono
-            wf.setsampwidth(2)          # 16-bit
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
             wf.setframerate(self.TARGET_SAMPLE_RATE)
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
@@ -273,30 +309,22 @@ class VADProcessor(FrameProcessor):
     # ── Pipecat frame processing ──────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """
-        Called by the Pipecat pipeline for every frame that arrives here.
-
-        We only act on AudioRawFrame; everything else passes through
-        unchanged so downstream processors can see it.
-        """
         await super().process_frame(frame, direction)
-
         if isinstance(frame, AudioRawFrame):
             await self._process_audio_chunk(frame.audio)
         else:
-            # Not our frame type — pass it downstream unchanged
             await self.push_frame(frame, direction)
 
     async def _process_audio_chunk(self, raw_pcm: bytes):
-        """Run one chunk of browser audio through the VAD state machine."""
+        """Run one chunk of browser audio through the Silero VAD state machine."""
 
         # Step 1: resample to 16 kHz
         pcm_16k = self._resample(raw_pcm)
 
-        # Step 2: compute energy of the 16-kHz chunk
-        energy = self._rms(pcm_16k)
+        # Step 2: get Silero speech probability
+        prob = self._speech_prob(pcm_16k)
 
-        if energy >= self.SPEECH_RMS_THRESHOLD:
+        if prob >= self.SPEECH_THRESHOLD:
             # ── SPEECH chunk ─────────────────────────────────────────────────
             self._silence_chunk_count = 0
             self._audio_buffer.append(pcm_16k)
@@ -305,20 +333,19 @@ class VADProcessor(FrameProcessor):
                 self._speech_chunks_seen += 1
                 if self._speech_chunks_seen >= self.MIN_SPEECH_CHUNKS:
                     self._is_speech_active = True
-                    logger.debug("VAD: speech STARTED")
+                    logger.debug(f"VAD: speech STARTED (prob={prob:.2f})")
         else:
             # ── SILENCE chunk ─────────────────────────────────────────────────
             if self._is_speech_active:
-                # Keep buffering (trailing silence is part of the utterance)
                 self._silence_chunk_count += 1
                 self._audio_buffer.append(pcm_16k)
 
-                silence_ended  = self._silence_chunk_count >= self.SILENCE_CHUNKS_NEEDED
-                hard_cap_hit   = len(self._audio_buffer) >= self.MAX_BUFFER_CHUNKS
+                silence_ended = self._silence_chunk_count >= self.SILENCE_CHUNKS_NEEDED
+                hard_cap_hit  = len(self._audio_buffer) >= self.MAX_BUFFER_CHUNKS
 
                 if silence_ended or hard_cap_hit:
                     reason = "silence" if silence_ended else "hard-cap"
-                    logger.info(f"VAD: utterance END ({reason})")
+                    logger.info(f"VAD: utterance END ({reason}, last_prob={prob:.2f})")
                     await self._emit_utterance()
 
     async def _emit_utterance(self):
@@ -327,12 +354,10 @@ class VADProcessor(FrameProcessor):
             self._reset_vad_state()
             return
 
-        raw_pcm  = b"".join(self._audio_buffer)
+        raw_pcm   = b"".join(self._audio_buffer)
         wav_bytes = self._pcm_to_wav(raw_pcm)
 
         logger.info(f"VAD: emitting SpeechEndFrame — {len(raw_pcm)} bytes PCM → {len(wav_bytes)} bytes WAV")
-
-        # Push the frame to the next stage (SarvamSTTService)
         await self.push_frame(SpeechEndFrame(audio_bytes=wav_bytes, sample_rate=self.TARGET_SAMPLE_RATE))
 
         self._reset_vad_state()

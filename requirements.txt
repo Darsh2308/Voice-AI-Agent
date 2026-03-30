@@ -29,3 +29,8 @@ loguru>=0.7.0        # structured logging used by pipecat internally
 # ── Phase 8: LangGraph memory + agent flow ────────────────────────────────────
 langgraph>=0.2.0     # state graph engine + MemorySaver checkpointer
 langchain-core>=0.3.0  # HumanMessage, AIMessage, BaseMessage types
+
+# ── Silero VAD: neural voice activity detection ───────────────────────────────
+torch>=2.0.0         # PyTorch runtime (CPU-only is fine, no GPU needed)
+torchaudio>=2.0.0    # required by silero-vad for audio utilities
+silero-vad>=5.1.2    # Silero VAD model loader (wraps torch.hub)
