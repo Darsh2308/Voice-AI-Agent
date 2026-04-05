@@ -2,7 +2,7 @@
 .env
 
 # Frontend (kept local only)
-index.html
+# index.html
 
 # Python
 venv/
@@ -27,3 +27,5 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+.claude/

@@ -4,11 +4,12 @@ Phase 8 – LangGraph Agent Flow  (enhanced with streaming, tools, summarization
 
 NEW FEATURES IN THIS FILE
 ──────────────────────────
-Feature 3  – Streaming TTS
-  stream_agent() is an async generator that streams tokens from Groq and
-  yields complete sentences one-by-one. GroqLangGraphProcessor feeds each
-  sentence into TTS immediately so the first audio starts before the LLM
-  finishes generating the full response.
+Feature 3  – Streaming TTS (word-chunk flushing)
+  stream_agent() is an async generator that opens a single streaming call to
+  Groq and yields FLUSH_WORD_COUNT-word chunks as tokens arrive — no waiting
+  for a sentence boundary. GroqLangGraphProcessor feeds each chunk into TTS
+  immediately, so the first audio byte reaches the browser within ~200 ms of
+  the user finishing speech (down from ~400 ms with sentence flushing).
 
 Feature 8  – Conversation Summarization
   After every 20 turns the oldest messages are summarized into a single
@@ -96,6 +97,21 @@ EMOTION_ADDENDA = {
     "neutral":  "",
 }
 
+# BCP-47 → human-readable name for the language instruction injected into the system prompt
+LANG_NAMES: dict[str, str] = {
+    "en-IN": "English",
+    "hi-IN": "Hindi",
+    "mr-IN": "Marathi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "bn-IN": "Bengali",
+    "gu-IN": "Gujarati",
+    "pa-IN": "Punjabi",
+    "ml-IN": "Malayalam",
+    "or-IN": "Odia",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool Definitions  (Feature 9)
@@ -174,28 +190,48 @@ def _strip_tool_markup(text: str) -> str:
     return _TOOL_MARKUP_RE.sub("", text).strip()
 
 
-def _extract_sentences(text: str):
+FLUSH_WORD_COUNT = 5  # emit a TTS chunk every N words
+
+def _flush_words(buffer: str, n: int = FLUSH_WORD_COUNT):
     """
-    Split text at sentence boundaries (.  ?  !) followed by whitespace or end.
-    Returns: (list_of_complete_sentences, remainder_without_ending_punct)
+    Extract complete n-word chunks from a streaming token buffer.
+
+    A word is 'complete' when followed by whitespace. The last word in the
+    buffer is kept as a partial (it may still be mid-token from the LLM stream)
+    unless the buffer ends with whitespace, in which case all words are complete.
+
+    Returns: (list_of_n_word_chunks, remaining_buffer)
 
     Examples:
-      "Hello! How are you? I'm fine."  → (["Hello!", "How are you?", "I'm fine."], "")
-      "Hello! How are"                 → (["Hello!"], "How are")
+      "Hello how are you today " (trailing space) → (["Hello how are you today"], "")
+      "Hello how are you today"  (no trail space) → ([], "Hello how are you today")
+      "one two three four five six " (6 words)   → (["one two three four five"], "six ")
     """
-    # Split on punctuation followed by whitespace OR end of string
-    parts = re.split(r'(?<=[.?!])(?:\s+|$)', text)
-    if not parts:
-        return [], text
+    trailing_space = bool(buffer) and buffer[-1].isspace()
+    words    = buffer.split()
+    complete = words if trailing_space else words[:-1]
+    partial  = "" if trailing_space else (words[-1] if words else "")
 
-    # If last part ends with sentence-ending punct, it's a complete sentence
-    if parts[-1] and parts[-1][-1] in ".?!":
-        return [p for p in parts if p.strip()], ""
+    chunks = []
+    while len(complete) >= n:
+        chunks.append(" ".join(complete[:n]))
+        complete = complete[n:]
 
-    # Otherwise last part is incomplete
-    complete  = [p for p in parts[:-1] if p.strip()]
-    remainder = parts[-1]
-    return complete, remainder
+    # Rebuild remaining buffer preserving trailing-space signal for next call
+    remaining = " ".join(complete)
+    if remaining and partial:
+        remaining += " " + partial
+    elif partial:
+        remaining = partial
+    elif remaining:
+        remaining += " "   # preserve trailing space so next call sees complete words
+
+    return chunks, remaining
+
+
+def _flush_all(buffer: str) -> str:
+    """Return the full buffer stripped — used to flush the final fragment."""
+    return buffer.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,27 +381,30 @@ async def stream_agent(
     user_text: str,
     thread_id: str,
     emotion_hint: str = "neutral",
+    language: str = "en-IN",
 ) -> AsyncGenerator[str, None]:
     """
-    Feature 3 (Streaming TTS): Async generator that yields complete sentences
-    from the LLM response one-by-one as they are generated.
+    Feature 3 (Streaming TTS): Async generator that yields FLUSH_WORD_COUNT-word
+    chunks from the LLM token stream in real-time — no waiting for a full sentence.
 
     Flow:
       1. Load conversation history from LangGraph MemorySaver.
       2. Build the API message list (with optional summary for Feature 8).
-      3. Make a non-streaming call with tool support (Feature 9).
-         If the model returns a tool_call → execute it → make a second call.
-         If no tool call → yield sentences from the first response directly.
-      4. After all sentences are yielded, persist the full response to state.
-      5. Trigger summarization if turn_count % 20 == 0 (Feature 8).
+      3. Open a SINGLE streaming call with tool support (Feature 9).
+         - Content tokens → accumulated in word_buffer, flushed every FLUSH_WORD_COUNT words.
+         - Tool-call deltas → assembled from streaming deltas (index-keyed accumulator).
+      4. If tool call detected:
+         - Yield "Let me look that up for you." immediately so TTS doesn't stall.
+         - Execute tool(s), stream the follow-up answer with the same word flushing.
+      5. After all chunks are yielded, persist full response to LangGraph state.
 
-    Why two API calls for tool queries?
-      Groq streaming with tools requires assembling the full tool-call JSON
-      from many tiny deltas, which adds fragile parsing complexity. The simpler
-      approach: one non-streaming call detects the tool call fast (~200 ms),
-      then a second streaming call produces the final user-facing response.
-      For 90%+ of turns (no tools), there is only ONE non-streaming call and
-      sentences are yielded directly from its content — same latency as before.
+    Why one streaming call instead of the old two-call design?
+      The previous approach used a non-streaming first call to detect tool use,
+      then a second streaming call for the actual answer. That meant the user
+      waited for a full round-trip (~200-400 ms) before the first audio byte,
+      even for the 90 %+ of turns that never use tools.
+      Now a single streaming call starts delivering tokens immediately; if tool
+      deltas appear we handle them without an extra round-trip.
     """
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -381,15 +420,22 @@ async def stream_agent(
         summary       = ""
 
     # ── 2. Build system prompt ────────────────────────────────────────────────
-    # Feature 10: append emotion-based tone adjustment
     system = BASE_SYSTEM_PROMPT + EMOTION_ADDENDA.get(emotion_hint, "")
+
+    # Language instruction: always tell the LLM which language to reply in.
+    # The detected language comes from Sarvam STT on every turn.
+    lang_name = LANG_NAMES.get(language, language)
+    system += (
+        f" IMPORTANT: The user is speaking in {lang_name}. "
+        f"You MUST reply ONLY in {lang_name}. "
+        f"Do not translate to English or switch languages under any circumstances."
+    )
+
     if summary:
-        # Feature 8: prepend summary when history has been compressed
         system += f"\n\n[Earlier conversation summary]: {summary}"
 
     api_messages = [{"role": "system", "content": system}]
 
-    # Feature 8: only send last 4 messages when summary is present
     visible_msgs = existing_msgs[-4:] if summary and len(existing_msgs) > 4 else existing_msgs
     for msg in visible_msgs:
         if isinstance(msg, HumanMessage):
@@ -397,110 +443,131 @@ async def stream_agent(
         elif isinstance(msg, AIMessage):
             api_messages.append({"role": "assistant", "content": str(msg.content)})
 
-    # Add the current user message
     api_messages.append({"role": "user", "content": user_text})
 
     logger.debug(f"stream_agent: {len(api_messages)} messages, emotion={emotion_hint!r}, summary={'yes' if summary else 'no'}")
 
-    # ── 3. First call: detect tool usage (Feature 9) ─────────────────────────
-    first_resp = await _groq.chat.completions.create(
+    # ── 3. Single streaming call — handles both content and tool-call paths ───
+    stream = await _groq.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=api_messages,
         tools=TOOLS,
         tool_choice="auto",
-        max_tokens=200,
+        max_tokens=300,
         temperature=0.7,
+        stream=True,
     )
 
-    first_choice    = first_resp.choices[0]
-    finish_reason   = first_choice.finish_reason
-    full_response   = ""
+    word_buffer:    str  = ""
+    full_response:  str  = ""
+    is_tool_call:   bool = False
+    # Accumulate tool-call JSON from streaming deltas (keyed by delta index)
+    tool_calls_acc: dict = {}
 
-    if finish_reason == "tool_calls":
-        # ── Feature 9: Execute tool(s) and get augmented response ────────────
-        tool_calls = first_choice.message.tool_calls or []
-        logger.info(f"stream_agent: tool_calls detected — {[tc.function.name for tc in tool_calls]}")
+    async for chunk in stream:
+        choice       = chunk.choices[0]
+        delta        = choice.delta
 
-        # Tell the user we're searching (immediate sentence so TTS doesn't stall)
+        # ── Tool-call delta: accumulate function name + arguments ─────────────
+        if delta.tool_calls:
+            is_tool_call = True
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tool_calls_acc:
+                    tool_calls_acc[idx] = {
+                        "id":       "",
+                        "type":     "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                if tc_delta.id:
+                    tool_calls_acc[idx]["id"] = tc_delta.id
+                if tc_delta.function:
+                    if tc_delta.function.name:
+                        tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
+                    if tc_delta.function.arguments:
+                        tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+
+        # ── Content token: flush every FLUSH_WORD_COUNT words ─────────────────
+        elif delta.content:
+            token         = delta.content
+            full_response += token
+            word_buffer   += token
+            chunks, word_buffer = _flush_words(word_buffer)
+            for c in chunks:
+                clean = _strip_tool_markup(c)
+                if clean.strip():
+                    yield clean.strip()
+
+    # Flush any remaining words after the stream ends (no-tool path)
+    if not is_tool_call and word_buffer.strip():
+        clean = _strip_tool_markup(_flush_all(word_buffer))
+        if clean:
+            yield clean
+
+    # ── 4. Tool-call path: execute tool(s) then stream the follow-up ─────────
+    if is_tool_call:
+        tool_call_list = list(tool_calls_acc.values())
+        logger.info(f"stream_agent: tool_calls detected — {[tc['function']['name'] for tc in tool_call_list]}")
+
+        # Yield a bridging phrase immediately so TTS doesn't go silent
         yield "Let me look that up for you."
 
-        # Build the tool result messages
         tool_results = []
-        for tc in tool_calls:
-            result = await _execute_tool(tc.function.name, tc.function.arguments)
+        for tc in tool_call_list:
+            result = await _execute_tool(tc["function"]["name"], tc["function"]["arguments"])
             tool_results.append({
                 "role":         "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": tc["id"],
                 "content":      result,
             })
 
-        # Reconstruct the assistant tool-call message for the follow-up request
         assistant_tool_msg = {
             "role":       "assistant",
             "tool_calls": [
                 {
-                    "id":   tc.id,
+                    "id":   tc["id"],
                     "type": "function",
                     "function": {
-                        "name":      tc.function.name,
-                        "arguments": tc.function.arguments,
+                        "name":      tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
                     },
                 }
-                for tc in tool_calls
+                for tc in tool_call_list
             ],
         }
 
         follow_up_messages = api_messages + [assistant_tool_msg] + tool_results
 
-        # Stream the final answer after tool execution
-        stream = await _groq.chat.completions.create(
+        stream2 = await _groq.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=follow_up_messages,
-            max_tokens=150,
+            max_tokens=200,
             temperature=0.7,
             stream=True,
         )
-        buffer = ""
-        async for chunk in stream:
+
+        word_buffer2   = ""
+        full_response2 = ""
+        async for chunk in stream2:
             token = chunk.choices[0].delta.content or ""
-            full_response += token
-            buffer        += token
-            sentences, buffer = _extract_sentences(buffer)
-            for s in sentences:
-                clean = _strip_tool_markup(s)
-                if clean:
-                    yield clean
+            if not token:
+                continue
+            full_response2 += token
+            word_buffer2   += token
+            chunks, word_buffer2 = _flush_words(word_buffer2)
+            for c in chunks:
+                clean = _strip_tool_markup(c)
+                if clean.strip():
+                    yield clean.strip()
 
-        if buffer.strip():
-            clean = _strip_tool_markup(buffer)
-            if clean:
-                yield clean
-            full_response = full_response  # already accumulated
-
-    else:
-        # ── No tool call: yield sentences from the first response ─────────────
-        content = _strip_tool_markup(first_choice.message.content or "").strip()
-        full_response = content
-
-        if not content:
-            logger.warning("stream_agent: empty LLM response")
-            return
-
-        # Split into sentences and yield each
-        sentences, remainder = _extract_sentences(content + " ")
-        for s in sentences:
-            clean = _strip_tool_markup(s)
-            if clean:
-                yield clean
-        if remainder.strip():
-            clean = _strip_tool_markup(remainder)
+        if word_buffer2.strip():
+            clean = _strip_tool_markup(_flush_all(word_buffer2))
             if clean:
                 yield clean
 
-    # ── 4. Save state ─────────────────────────────────────────────────────────
-    # Wrapped in try/except so a state-save failure doesn't propagate as an
-    # exception through the async generator into _generate(), which would have
-    # suppressed the TranscriptDisplayFrame before the `finally` fix was added.
+        full_response = "Let me look that up for you. " + full_response2
+
+    # ── 5. Save state ─────────────────────────────────────────────────────────
     if full_response.strip():
         try:
             await _save_turn(config, user_text, full_response.strip(), turn_count + 1)

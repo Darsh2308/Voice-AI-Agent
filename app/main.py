@@ -32,10 +32,12 @@ Feature 7  – Language Auto-Switch
 
 import asyncio
 import json
+import os
 import sys
 import time
 
 from fastapi import FastAPI, File, UploadFile, WebSocket
+from fastapi.responses import FileResponse
 from loguru import logger
 import shutil
 

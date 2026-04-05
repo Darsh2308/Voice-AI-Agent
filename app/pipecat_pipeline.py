@@ -582,8 +582,9 @@ class GroqLangGraphProcessor(FrameProcessor):
 
     def __init__(self, thread_id: str, **kwargs):
         super().__init__(**kwargs)
-        self._thread_id   = thread_id
+        self._thread_id    = thread_id
         self._emotion_hint = "neutral"   # Feature 10: updated by EmotionHintFrame
+        self._language     = "en-IN"     # updated by LanguageDetectedFrame each turn
         logger.info(f"GroqLangGraphProcessor: thread_id={thread_id}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -597,6 +598,13 @@ class GroqLangGraphProcessor(FrameProcessor):
             # Don't push downstream — this frame is consumed here.
             self._emotion_hint = frame.hint
             logger.debug(f"LLM: emotion hint updated → {frame.hint!r}")
+
+        elif isinstance(frame, LanguageDetectedFrame):
+            # Capture the detected language so the next LLM call replies in it.
+            # Still forward downstream — TTS and browser badge need this frame too.
+            self._language = frame.language_code
+            logger.debug(f"LLM: language updated → {frame.language_code!r}")
+            await self.push_frame(frame, direction)
 
         else:
             await self.push_frame(frame, direction)
@@ -626,7 +634,7 @@ class GroqLangGraphProcessor(FrameProcessor):
         first_sentence = True
 
         try:
-            async for sentence in stream_agent(user_text, self._thread_id, self._emotion_hint):
+            async for sentence in stream_agent(user_text, self._thread_id, self._emotion_hint, self._language):
                 if not sentence.strip():
                     continue
 
