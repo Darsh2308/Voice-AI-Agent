@@ -588,7 +588,7 @@
     <h2>⚙️ Settings</h2>
     <div class="field">
       <label>BACKEND URL</label>
-      <input id="cfg-url" type="text" value="ws://localhost:8000/ws" placeholder="ws://localhost:8000/ws" />
+      <input id="cfg-url" type="text" placeholder="ws://localhost:8000/ws" />
     </div>
     <div class="field">
       <label>AUDIO CHUNK SIZE (samples)</label>
@@ -608,8 +608,15 @@
 /* ═══════════════════════════════════════════════════════
    CONFIG
 ═══════════════════════════════════════════════════════ */
+function defaultWsUrl() {
+  // Auto-derive from page origin — works on localhost AND production (wss://)
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host  = window.location.host || 'localhost:8000';
+  return `${proto}//${host}/ws`;
+}
+
 let config = {
-  wsUrl:     localStorage.getItem('va_url')   || 'ws://localhost:8000/ws',
+  wsUrl:     localStorage.getItem('va_url')   || defaultWsUrl(),
   chunkSize: parseInt(localStorage.getItem('va_chunk') || '4096'),
 };
 

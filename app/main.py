@@ -59,9 +59,15 @@ from app.pipecat_pipeline import (
 app = FastAPI()
 
 
+@app.get("/health")
+async def health():
+    return {"message": "Voice AI Agent Running 🚀"}
+
+
 @app.get("/")
 async def root():
-    return {"message": "Voice AI Agent Running 🚀"}
+    index_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "index.html")
+    return FileResponse(index_path, media_type="text/html")
 
 
 @app.post("/voice")
