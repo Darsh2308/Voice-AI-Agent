@@ -82,7 +82,7 @@ class AgentState(TypedDict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 BASE_SYSTEM_PROMPT = (
-    "You are a helpful voice assistant. "
+    "You are Ada, a helpful voice assistant. "
     "Keep ALL responses under 2-3 short sentences — you are speaking aloud, not writing. "
     "Never use bullet points, headers, or markdown. "
     "You have memory of the full conversation, so use context from earlier turns. "
@@ -190,43 +190,73 @@ def _strip_tool_markup(text: str) -> str:
     return _TOOL_MARKUP_RE.sub("", text).strip()
 
 
-FLUSH_WORD_COUNT = 5  # emit a TTS chunk every N words
+# Primary split: sentence-ending punctuation followed by whitespace or newline.
+#   .  ?  !          — Latin/English sentence endings
+#   ।  ॥             — Devanagari danda / double danda (Hindi, Marathi, Sanskrit)
+#   ？  ！           — Full-width punctuation (used in some Indic LLM outputs)
+# Newlines also trigger a flush.
+_SENTENCE_END_RE = re.compile(r'(?<=[.?!।॥？！])\s+|\n+')
 
-def _flush_words(buffer: str, n: int = FLUSH_WORD_COUNT):
+# Secondary split: commas/semicolons — only used when a clause is already
+# long enough (≥4 words) to be a natural speech pause.  Sarvam TTS internally
+# splits on commas and returns multiple `audios` entries; sending a pre-split
+# chunk guarantees a single clean audio clip with no concatenation needed.
+_COMMA_RE = re.compile(r'(?<=[,;،、])\s+')
+_MIN_WORDS_BEFORE_COMMA_SPLIT = 4   # don't split "हाय, नमस्कार" but do split longer clauses
+
+
+def _flush_sentences(buffer: str):
     """
-    Extract complete n-word chunks from a streaming token buffer.
+    Extract speakable chunks from a streaming token buffer.
 
-    A word is 'complete' when followed by whitespace. The last word in the
-    buffer is kept as a partial (it may still be mid-token from the LLM stream)
-    unless the buffer ends with whitespace, in which case all words are complete.
+    Pass 1 — split on sentence-ending punctuation (. ? ! । ॥ ？ ！) or newlines.
+    Pass 2 — for any chunk that still contains a comma/semicolon, further split
+             on that comma *only if* the text before it has ≥4 words.  This
+             prevents Sarvam TTS from receiving comma-heavy sentences that it
+             would internally split into multiple `audios` entries (causing the
+             WAV concatenation path and potential audio truncation).
 
-    Returns: (list_of_n_word_chunks, remaining_buffer)
+    The last piece from the primary split is kept as the remainder
+    (may be mid-sentence) and is never comma-split yet.
 
-    Examples:
-      "Hello how are you today " (trailing space) → (["Hello how are you today"], "")
-      "Hello how are you today"  (no trail space) → ([], "Hello how are you today")
-      "one two three four five six " (6 words)   → (["one two three four five"], "six ")
+    Returns: (list_of_chunks, remaining_buffer)
     """
-    trailing_space = bool(buffer) and buffer[-1].isspace()
-    words    = buffer.split()
-    complete = words if trailing_space else words[:-1]
-    partial  = "" if trailing_space else (words[-1] if words else "")
+    parts = _SENTENCE_END_RE.split(buffer)
+    if len(parts) <= 1:
+        return [], buffer
 
-    chunks = []
-    while len(complete) >= n:
-        chunks.append(" ".join(complete[:n]))
-        complete = complete[n:]
+    complete = [p.strip() for p in parts[:-1] if p.strip()]
+    remaining = parts[-1].strip()
 
-    # Rebuild remaining buffer preserving trailing-space signal for next call
-    remaining = " ".join(complete)
-    if remaining and partial:
-        remaining += " " + partial
-    elif partial:
-        remaining = partial
-    elif remaining:
-        remaining += " "   # preserve trailing space so next call sees complete words
+    result = []
+    for chunk in complete:
+        result.extend(_comma_split(chunk))
+    return result, remaining
 
-    return chunks, remaining
+
+def _comma_split(text: str) -> list:
+    """
+    Split *text* on commas/semicolons, but only when the clause before the
+    split point is ≥ _MIN_WORDS_BEFORE_COMMA_SPLIT words long.
+    Always returns at least one element (the original text if no split applied).
+    """
+    sub_parts = _COMMA_RE.split(text)
+    if len(sub_parts) <= 1:
+        return [text]
+
+    out     = []
+    current = ""
+    for part in sub_parts:
+        candidate = (current + ", " + part).strip() if current else part
+        # Count words (works for both Latin-script and Indic scripts separated by spaces)
+        if current and len(current.split()) >= _MIN_WORDS_BEFORE_COMMA_SPLIT:
+            out.append(current.strip())
+            current = part
+        else:
+            current = candidate
+    if current.strip():
+        out.append(current.strip())
+    return out if out else [text]
 
 
 def _flush_all(buffer: str) -> str:
@@ -424,11 +454,17 @@ async def stream_agent(
 
     # Language instruction: always tell the LLM which language to reply in.
     # The detected language comes from Sarvam STT on every turn.
+    # Rule: reply ONLY in the detected language — no mixing, no switching.
     lang_name = LANG_NAMES.get(language, language)
     system += (
-        f" IMPORTANT: The user is speaking in {lang_name}. "
-        f"You MUST reply ONLY in {lang_name}. "
-        f"Do not translate to English or switch languages under any circumstances."
+        f"\n\nLANGUAGE RULE (mandatory): The user is speaking {lang_name}."
+        f" You MUST reply ENTIRELY in {lang_name}."
+        f" Do NOT mix in any other language."
+        f" Use the native script of {lang_name}"
+        f" (e.g. Devanagari for Hindi/Marathi, Tamil script for Tamil, etc.)."
+        f" Even if the user's input was typed in Roman/Latin script,"
+        f" your reply must be in proper {lang_name} native script."
+        f" Violating this rule is not allowed under any circumstances."
     )
 
     if summary:
@@ -487,30 +523,52 @@ async def stream_agent(
                     if tc_delta.function.arguments:
                         tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
 
-        # ── Content token: flush every FLUSH_WORD_COUNT words ─────────────────
+        # ── Content token: flush on sentence boundaries ───────────────────────
         elif delta.content:
             token         = delta.content
             full_response += token
             word_buffer   += token
-            chunks, word_buffer = _flush_words(word_buffer)
+            chunks, word_buffer = _flush_sentences(word_buffer)
+            # Fallback: flush if the buffer grows very long with no sentence boundary.
+            # Threshold is high (40 words) so it only fires for truly unpunctuated
+            # responses — normal sentences with . ? ! । should split cleanly above.
+            if not chunks and len(word_buffer.split()) >= 40:
+                chunks    = [word_buffer.strip()]
+                word_buffer = ""
             for c in chunks:
                 clean = _strip_tool_markup(c)
                 if clean.strip():
+                    logger.info(f"stream_agent: yielding sentence → {clean.strip()!r}")
                     yield clean.strip()
 
-    # Flush any remaining words after the stream ends (no-tool path)
+    # Flush any remaining text after the stream ends (no-tool path)
     if not is_tool_call and word_buffer.strip():
         clean = _strip_tool_markup(_flush_all(word_buffer))
         if clean:
+            logger.info(f"stream_agent: yielding final fragment → {clean!r}")
             yield clean
+
+    logger.info(f"stream_agent: done streaming. full_response={full_response!r}")
 
     # ── 4. Tool-call path: execute tool(s) then stream the follow-up ─────────
     if is_tool_call:
         tool_call_list = list(tool_calls_acc.values())
         logger.info(f"stream_agent: tool_calls detected — {[tc['function']['name'] for tc in tool_call_list]}")
 
-        # Yield a bridging phrase immediately so TTS doesn't go silent
-        yield "Let me look that up for you."
+        # Yield a bridging phrase immediately so TTS doesn't go silent.
+        # Use a language-matched phrase so it doesn't break a non-English turn.
+        SEARCH_PHRASES = {
+            "hi-IN": "एक पल, मैं देखता हूँ।",
+            "mr-IN": "एक मिनिट, मी शोधतो.",
+            "ta-IN": "ஒரு நிமிடம், தேடுகிறேன்.",
+            "te-IN": "ఒక్క నిమిషం, వెతుకుతున్నాను.",
+            "kn-IN": "ಒಂದು ನಿಮಿಷ, ಹುಡುಕುತ್ತೇನೆ.",
+            "bn-IN": "একটু অপেক্ষা করুন, খুঁজে দেখছি।",
+            "gu-IN": "એક ક્ષણ, હું શોધું છું.",
+            "pa-IN": "ਇੱਕ ਮਿੰਟ, ਮੈਂ ਲੱਭਦਾ ਹਾਂ।",
+            "ml-IN": "ഒരു നിമിഷം, ഞാൻ നോക്കുന്നു.",
+        }
+        yield SEARCH_PHRASES.get(language, "Let me look that up for you.")
 
         tool_results = []
         for tc in tool_call_list:
@@ -554,7 +612,7 @@ async def stream_agent(
                 continue
             full_response2 += token
             word_buffer2   += token
-            chunks, word_buffer2 = _flush_words(word_buffer2)
+            chunks, word_buffer2 = _flush_sentences(word_buffer2)
             for c in chunks:
                 clean = _strip_tool_markup(c)
                 if clean.strip():
@@ -565,7 +623,7 @@ async def stream_agent(
             if clean:
                 yield clean
 
-        full_response = "Let me look that up for you. " + full_response2
+        full_response = SEARCH_PHRASES.get(language, "Let me look that up for you.") + " " + full_response2
 
     # ── 5. Save state ─────────────────────────────────────────────────────────
     if full_response.strip():

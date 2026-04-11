@@ -201,6 +201,17 @@ class BargeInDetectedFrame(Frame):
     pass
 
 
+class LLMTurnDoneFrame(Frame):
+    """
+    Emitted by GroqLangGraphProcessor after all TextFrames for a turn have
+    been pushed. Travels through the pipeline IN ORDER so SarvamTTSService
+    receives it only after every TextFrame for this turn has been processed.
+    This replaces the external flush() call which had a race condition:
+    flush() could be called before the last TextFrame reached process_frame.
+    """
+    pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  VADProcessor  (Voice Activity Detection — Silero VAD)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,11 +470,72 @@ class SarvamSTTService(FrameProcessor):
         "pa": "pa-IN", "ml": "ml-IN", "or": "or-IN",
     }
 
+    # Romanized Indian-language word lists keyed by BCP-47 code.
+    # Used to recover the correct language when Sarvam mis-labels romanized
+    # Indian speech as "en" (a known limitation of auto-detect mode).
+    # Words chosen as high-frequency function words that cannot plausibly appear
+    # in real English sentences.
+    ROMANIZED_MARKERS: dict[str, set] = {
+        "hi-IN": {
+            "kya", "aap", "main", "mein", "hai", "hain", "nahi", "nahin",
+            "baat", "saath", "mere", "mera", "meri", "tum", "tumhara",
+            "sakte", "sakta", "sakti", "chahiye", "hoga", "yeh", "woh",
+            "kaise", "kahan", "kyun", "kyunki", "lekin", "aur", "agar",
+            "toh", "phir", "abhi", "bahut", "thoda", "kuch", "koi",
+            "accha", "theek", "haan", "bolo", "batao", "namaste",
+        },
+        "mr-IN": {
+            "majha", "majhi", "mala", "tula", "aahe", "aahes", "naav",
+            "kay", "kasa", "kashi", "kashala", "tumhi", "aami", "tyala",
+            "tila", "aplya", "ata", "aani", "pan", "jar", "tar", "mhanje",
+            "sangto", "sangta", "bagh", "bagha", "yeto", "yete", "jato",
+            "jate", "ghara", "shala", "pudhe", "mage", "khup", "thoda",
+        },
+        "ta-IN": {
+            "enna", "naan", "nee", "avan", "aval", "avanga", "vandhen",
+            "pogiren", "sollu", "paarunga", "theriyum", "illai", "aamaa",
+            "enakku", "unnakku", "ingey", "angey", "eppo", "eppadi",
+            "romba", "konjam", "yaarukku", "enna", "solren",
+        },
+        "te-IN": {
+            "nenu", "meeru", "atanu", "aame", "vaallu", "vachchanu",
+            "velthanu", "cheppandi", "chudandi", "telusa", "ledu", "avunu",
+            "naaku", "meeku", "ikkada", "akkada", "eppudu", "ela",
+            "chala", "konchem", "evaru", "emi", "chestanu",
+        },
+        "kn-IN": {
+            "nanu", "neevu", "avanu", "avalu", "avaru", "bartini",
+            "hoguttini", "heli", "nodi", "gotthu", "illa", "howdu",
+            "nanage", "nimage", "illi", "alli", "yaavaga", "hege",
+            "thumba", "swalpa", "yaaru", "yenu", "maaduttini",
+        },
+        "pa-IN": {
+            "main", "tussi", "oh", "assi", "aaya", "gaya", "karo",
+            "dekho", "dassi", "pata", "nahi", "haan", "kiddan",
+            "kiven", "kithe", "kyon", "bahut", "thoda", "koi",
+            "kuch", "sanu", "tenu", "saade", "twaade",
+        },
+        "gu-IN": {
+            "hoon", "tame", "te", "ame", "aavyo", "gayo", "karo",
+            "juo", "khabar", "nathi", "haa", "kem", "kyare",
+            "kyaan", "kem", "ghanu", "thodu", "koi", "kuch",
+            "mane", "tane", "amane", "tamane",
+        },
+        "bn-IN": {
+            "ami", "tumi", "se", "tara", "eshechi", "gechi", "bolo",
+            "dekho", "jano", "na", "haan", "kemon", "kobe", "kothay",
+            "keno", "onek", "ektu", "ke", "ki", "amake", "tomake",
+        },
+    }
+
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
         self._api_key     = api_key
         self._http        = httpx.AsyncClient(timeout=30.0)
-        self._language    = "en-IN"   # Feature 7: adapts after first detection
+        # Always "unknown" — Sarvam auto-detects every turn independently.
+        # We never persist the detected language here because locking to a
+        # language would break switching (e.g. user goes English → Hindi → English).
+        self._language    = "unknown"
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -493,7 +565,14 @@ class SarvamSTTService(FrameProcessor):
                     self.SARVAM_ASR_URL,
                     headers={"api-subscription-key": self._api_key},
                     files={"file": ("audio.wav", f, "audio/wav")},
-                    data={"model": "saarika:v2.5", "language_code": self._language},
+                    data={
+                        "model": "saarika:v2.5",
+                        # Always "unknown" — let Sarvam auto-detect every turn.
+                        # This is the only way to correctly handle mid-conversation
+                        # language switches (English → Hindi → English → Marathi…).
+                        "language_code": "unknown",
+                        "with_disfluencies": "false",
+                    },
                 )
 
             if resp.status_code != 200:
@@ -505,13 +584,32 @@ class SarvamSTTService(FrameProcessor):
             logger.info(f"STT transcript: {transcript!r}")
 
             # ── Feature 7: Language detection ──────────────────────────────
-            # Sarvam returns the detected language_code in the response.
-            # Normalize it to BCP-47 format (e.g. "hi" → "hi-IN").
-            raw_lang   = resp_json.get("language_code", self._language)
-            detected   = self.LANG_NORMALIZE.get(raw_lang, raw_lang)
-            if detected != self._language:
-                logger.info(f"STT: language changed {self._language!r} → {detected!r}")
-                self._language = detected
+            # Sarvam returns the detected language code in the response.
+            # We normalise it, then apply a romanized-language correction pass:
+            # Sarvam's auto-detect sometimes returns "en" for romanized Indian
+            # speech (e.g. Hinglish, romanized Marathi, etc.) because the text
+            # looks Latin-script. We scan the transcript for known function words
+            # of each Indian language and override when we get ≥2 hits.
+            raw_lang = resp_json.get("language_code", "en")
+            detected = self.LANG_NORMALIZE.get(raw_lang, raw_lang)
+
+            if detected == "en-IN" and transcript:
+                words = set(transcript.lower().replace(",", " ").replace(".", " ").split())
+                best_lang  = None
+                best_count = 0
+                for lang_code, markers in self.ROMANIZED_MARKERS.items():
+                    hits = len(words & markers)
+                    if hits > best_count:
+                        best_count = hits
+                        best_lang  = lang_code
+                if best_count >= 2 and best_lang:
+                    logger.info(
+                        f"STT: romanized {best_lang} detected ({best_count} markers) — "
+                        f"overriding language en-IN → {best_lang}"
+                    )
+                    detected = best_lang
+
+            logger.info(f"STT: language={detected!r}")
             await self.push_frame(LanguageDetectedFrame(language_code=detected))
 
             # ── Feature 10: Emotion hint from confidence ────────────────────
@@ -580,11 +678,12 @@ class GroqLangGraphProcessor(FrameProcessor):
     the TTS pipeline to start synthesizing immediately.
     """
 
-    def __init__(self, thread_id: str, **kwargs):
+    def __init__(self, thread_id: str, tts_service=None, **kwargs):
         super().__init__(**kwargs)
         self._thread_id    = thread_id
         self._emotion_hint = "neutral"   # Feature 10: updated by EmotionHintFrame
         self._language     = "en-IN"     # updated by LanguageDetectedFrame each turn
+        self._tts          = tts_service # reference to SarvamTTSService for flush()
         logger.info(f"GroqLangGraphProcessor: thread_id={thread_id}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -644,6 +743,7 @@ class GroqLangGraphProcessor(FrameProcessor):
                     first_sentence = False
 
                 full_text += sentence.strip() + " "
+                logger.info(f"LLM→TTS: pushing TextFrame → {sentence.strip()!r}")
                 # Feature 3: push each sentence to TTS immediately
                 await self.push_frame(TextFrame(text=sentence.strip()))
 
@@ -664,6 +764,13 @@ class GroqLangGraphProcessor(FrameProcessor):
 
         # Reset emotion hint after use — next turn starts neutral
         self._emotion_hint = "neutral"
+
+        # Push the sentinel THROUGH the pipeline so it arrives at SarvamTTSService
+        # only AFTER all the TextFrames from this turn have been processed.
+        # This fixes the race where the old flush() call happened before the last
+        # TextFrame reached SarvamTTSService.process_frame.
+        logger.info("LLM: pushing LLMTurnDoneFrame sentinel downstream")
+        await self.push_frame(LLMTurnDoneFrame())
 
     def reset_thread(self):
         """Start a new conversation by assigning a new thread_id."""
@@ -691,12 +798,55 @@ class GroqLangGraphProcessor(FrameProcessor):
 #            AIStatusFrame(False)   (after last sentence audio)
 #
 
+def _concat_wavs(wav_list: list[bytes]) -> bytes:
+    """
+    Concatenate multiple WAV byte blobs into a single WAV.
+    All clips must share the same sample rate, channels, and sample width
+    (Sarvam always returns mono 22050 Hz 16-bit, so this is safe).
+    Returns a single well-formed WAV byte string.
+    """
+    if not wav_list:
+        return b""
+    if len(wav_list) == 1:
+        return wav_list[0]
+
+    frames_list = []
+    params = None
+    for wav_bytes in wav_list:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            if params is None:
+                params = wf.getparams()
+            frames_list.append(wf.readframes(wf.getnframes()))
+
+    out_buf = io.BytesIO()
+    with wave.open(out_buf, "wb") as wf_out:
+        wf_out.setparams(params)
+        for frames in frames_list:
+            wf_out.writeframes(frames)
+    return out_buf.getvalue()
+
+
 class SarvamTTSService(FrameProcessor):
     """
-    Synthesizes speech sentence by sentence.
-    The first AIStatusFrame(True) is emitted before the very first sentence.
-    AIStatusFrame(False) is emitted only once, after the last TextFrame
-    has been synthesized. This is managed by tracking whether TTS is "active".
+    Synthesizes speech chunk by chunk with CONCURRENT API calls + in-order delivery.
+
+    Problem with the old design:
+      process_frame() awaited _synthesize() before returning, so the pipeline
+      stalled waiting for the TTS HTTP round-trip (~300-500 ms) before the next
+      TextFrame could even be pushed. Groq streaming was effectively serialised
+      through the TTS bottleneck — the user heard nothing until the last chunk
+      was synthesised.
+
+    New design — pipeline-parallel TTS:
+      1. Each TextFrame immediately fires a background asyncio.Task for the API
+         call. process_frame() returns right away so Groq can keep streaming.
+      2. A monotonic sequence counter (_seq) stamps each chunk in arrival order.
+      3. A delivery loop (_delivery_task) waits for futures in order and pushes
+         AIAudioFrame to OutputSink the moment each one resolves, preserving
+         playback order even if a later chunk's API call finishes first.
+      4. When the LLM turn ends, GroqLangGraphProcessor pushes a TextFrame with
+         text=None as a sentinel — the delivery loop drains remaining futures,
+         emits AIStatusFrame(False), and resets for the next turn.
     """
 
     SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
@@ -704,27 +854,252 @@ class SarvamTTSService(FrameProcessor):
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
-        self._api_key   = api_key
-        self._http      = httpx.AsyncClient(timeout=30.0)
-        # Feature 7: updated when LanguageDetectedFrame arrives
-        self._language  = "en-IN"
-        self._tts_active = False   # tracks if we've sent AIStatusFrame(True) already
+        self._api_key          = api_key
+        self._http             = httpx.AsyncClient(timeout=30.0)
+        self._language         = "en-IN"   # Feature 7: updated by LanguageDetectedFrame
+        self._tts_active       = False
+        # In-order delivery: list of futures in arrival order
+        self._pending: list    = []
+        self._delivery_task    = None
+        # Lazily created in process_frame (needs a running loop)
+        self._llm_done: asyncio.Event | None = None
+        # Track background tasks so interrupt() can cancel them
+        self._inflight_tasks: list = []
+
+    # ── Pipecat frame handler ─────────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TextFrame):
-            await self._synthesize(frame.text)
+            loop = asyncio.get_running_loop()
+            fut  = loop.create_future()
+            # Capture language NOW — before any future LanguageDetectedFrame
+            # could arrive mid-turn and change self._language underneath us.
+            lang_at_dispatch = self._language
+
+            # Detect a NEW turn by checking whether the previous turn's
+            # llm_done event is already set (or no event exists yet).
+            # Using _delivery_task.done() is NOT reliable because the task
+            # stays alive through its finally-block (which awaits push_frame),
+            # and TextFrames from the new turn can arrive during that await —
+            # they would be appended to the old _pending list and then wiped
+            # by my_pending.clear() in the finally block.
+            # Checking llm_done.is_set() is the correct signal: it means the
+            # previous turn has fully committed all its sentences, so any new
+            # TextFrame belongs to a fresh turn that needs its own list+event.
+            new_turn = (self._llm_done is None or self._llm_done.is_set())
+            if new_turn:
+                self._llm_done      = asyncio.Event()   # fresh, unset
+                self._pending       = []                # fresh list for this turn
+                self._delivery_task = asyncio.create_task(self._deliver_in_order())
+
+            self._pending.append(fut)
+            task = asyncio.create_task(
+                self._call_tts_api(frame.text, fut, lang_at_dispatch)
+            )
+            self._inflight_tasks.append(task)
+            task.add_done_callback(lambda t: self._inflight_tasks.remove(t)
+                                   if t in self._inflight_tasks else None)
+
+        elif isinstance(frame, LLMTurnDoneFrame):
+            # All TextFrames for this turn have now been processed in order.
+            # Just set the event — do NOT await flush() here because that would
+            # block process_frame while the delivery loop tries to push frames
+            # back through the same pipeline, causing a deadlock.
+            # The delivery loop drains itself once _llm_done is set.
+            logger.info("TTS: LLMTurnDoneFrame received — setting _llm_done")
+            if self._llm_done is not None:
+                self._llm_done.set()
 
         elif isinstance(frame, LanguageDetectedFrame):
-            # Feature 7: update TTS language for all subsequent sentences
             self._language = frame.language_code
             logger.info(f"TTS: language switched to {frame.language_code!r}")
-            # Also pass the frame downstream so OutputSink can forward it to browser
             await self.push_frame(frame, direction)
 
         else:
             await self.push_frame(frame, direction)
+
+    # ── Background: HTTP call, resolves a future with wav bytes ──────────────
+
+    async def _call_tts_api(self, text: str, fut: asyncio.Future, language: str):
+        """Call Sarvam TTS and resolve *fut* with WAV bytes (or None on error)."""
+        chunk_id = id(fut)
+        try:
+            tts_text = self._truncate(text)
+            logger.info(f"TTS[{chunk_id}]: START request text={tts_text!r} lang={language!r}")
+
+            resp = await self._http.post(
+                self.SARVAM_TTS_URL,
+                headers={
+                    "api-subscription-key": self._api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "inputs":               [tts_text],
+                    "target_language_code": language,
+                    "speaker":              "anushka",
+                    "model":                "bulbul:v2",
+                },
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"TTS[{chunk_id}]: HTTP {resp.status_code}: {resp.text[:200]}")
+                if not fut.done():
+                    fut.set_result(None)
+                return
+
+            audios_b64 = resp.json().get("audios", [])
+            audios_b64 = [a for a in audios_b64 if a]  # drop empty entries
+            if not audios_b64:
+                logger.error(f"TTS[{chunk_id}]: empty audio in response")
+                if not fut.done():
+                    fut.set_result(None)
+                return
+
+            if len(audios_b64) == 1:
+                wav_bytes = base64.b64decode(audios_b64[0])
+            else:
+                # Sarvam may return multiple audio clips (e.g. when the input
+                # contains a comma it sometimes splits internally).
+                # Concatenate all clips into a single WAV so nothing is lost.
+                wav_bytes = _concat_wavs([base64.b64decode(a) for a in audios_b64])
+                logger.info(f"TTS[{chunk_id}]: concatenated {len(audios_b64)} audio clips")
+
+            logger.info(f"TTS[{chunk_id}]: DONE resolved {len(wav_bytes)} bytes for {tts_text!r}")
+            if not fut.done():
+                fut.set_result(wav_bytes)
+
+        except asyncio.CancelledError:
+            logger.warning(f"TTS[{chunk_id}]: CANCELLED for text={text!r}")
+            if not fut.done():
+                fut.set_result(None)
+        except Exception as e:
+            logger.error(f"TTS[{chunk_id}]: ERROR {e} for text={text!r}")
+            if not fut.done():
+                fut.set_result(None)
+
+    # ── Delivery loop: push audio frames in original arrival order ────────────
+
+    async def _deliver_in_order(self):
+        """
+        Drain _pending futures in order, pushing audio downstream as each resolves.
+
+        The loop keeps running until BOTH conditions are true:
+          1. _llm_done is set  (flush() called after LLM finishes streaming)
+          2. _pending is empty (all in-flight TTS requests have resolved)
+
+        This prevents the race where the loop exits after draining an early batch
+        while the LLM is still yielding more chunks.
+        """
+        chunk_n = 0
+        first   = True
+        # Take a snapshot of BOTH the event AND the pending list for THIS turn.
+        # If a new turn starts while we're in finally-block cleanup,
+        # process_frame will have already replaced self._llm_done and
+        # self._pending — we must not touch those new-turn objects here.
+        llm_done     = self._llm_done
+        my_pending   = self._pending   # same list object for this turn
+        try:
+            while True:
+                if not my_pending:
+                    # Nothing left to deliver. Exit only if the LLM has
+                    # confirmed it's done sending text for THIS turn.
+                    if llm_done.is_set():
+                        break
+                    # LLM still streaming — wait for it to signal done,
+                    # then loop back to check my_pending again (more chunks
+                    # may have arrived while we were waiting).
+                    try:
+                        await asyncio.wait_for(llm_done.wait(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        logger.error("TTS delivery: timed out waiting for LLM done signal")
+                        break
+                    continue
+
+                fut = my_pending.pop(0)
+                chunk_n += 1
+                fut_id = id(fut)
+                logger.info(f"TTS delivery: waiting for chunk #{chunk_n} fut={fut_id}")
+                try:
+                    wav_bytes = await asyncio.wait_for(
+                        asyncio.shield(fut), timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"TTS delivery: chunk #{chunk_n} timed out, skipping")
+                    continue
+
+                if wav_bytes is None:
+                    logger.error(f"TTS delivery: chunk #{chunk_n} fut={fut_id} resolved None — TTS API failed, skipping")
+                    continue
+
+                logger.info(f"TTS delivery: pushing chunk #{chunk_n} ({len(wav_bytes)} bytes) to browser")
+                if first:
+                    first = False
+                    self._tts_active = True
+                    await self.push_frame(AIStatusFrame(ai_speaking=True))
+
+                await self.push_frame(AIAudioFrame(audio_bytes=wav_bytes))
+
+        except asyncio.CancelledError:
+            logger.warning("TTS delivery: cancelled mid-delivery")
+            pass  # interrupted — finally block handles cleanup
+        except Exception as e:
+            logger.error(f"TTS delivery error: {e}")
+        finally:
+            logger.info(f"TTS delivery: loop exiting — delivered {chunk_n} chunks, tts_active={self._tts_active}")
+            if self._tts_active:
+                await self.push_frame(AIStatusFrame(ai_speaking=False))
+            self._tts_active = False
+            # Clear only this turn's pending list — NOT self._pending, which
+            # may have already been replaced by a new turn's list object.
+            my_pending.clear()
+
+    # ── Called by GroqLangGraphProcessor when the LLM turn is complete ────────
+
+    async def flush(self):
+        """
+        Signal that the LLM has finished streaming, then wait for the delivery
+        loop to drain all remaining in-flight TTS requests and push their audio.
+        """
+        if self._llm_done is not None:
+            self._llm_done.set()
+        if self._delivery_task and not self._delivery_task.done():
+            try:
+                await asyncio.wait_for(self._delivery_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error("TTS flush: timed out")
+                self._delivery_task.cancel()
+            except Exception as e:
+                logger.error(f"TTS flush error: {e}")
+
+    async def cancel_turn(self):
+        """
+        Called on barge-in / interrupt: cancel all in-flight TTS API tasks
+        and stop the delivery loop immediately so no stale audio is pushed.
+        """
+        # Cancel in-flight HTTP tasks
+        for task in list(self._inflight_tasks):
+            task.cancel()
+        self._inflight_tasks.clear()
+
+        # Resolve any pending futures with None so the delivery loop unblocks
+        for fut in self._pending:
+            if not fut.done():
+                fut.set_result(None)
+        self._pending.clear()
+
+        # Cancel the delivery loop itself
+        if self._delivery_task and not self._delivery_task.done():
+            self._delivery_task.cancel()
+            try:
+                await self._delivery_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        self._tts_active = False
+        if self._llm_done is not None:
+            self._llm_done.clear()
 
     def _truncate(self, text: str) -> str:
         """Keep text within Sarvam's per-item character limit."""
@@ -736,68 +1111,6 @@ class SarvamTTSService(FrameProcessor):
             if last > self.TTS_CHAR_LIMIT // 2:
                 return truncated[:last + 1]
         return truncated
-
-    async def _synthesize(self, text: str):
-        """
-        Synthesize one sentence and emit audio.
-
-        Feature 3 (Streaming TTS):
-          - AIStatusFrame(True) is emitted only before the FIRST sentence.
-          - AIStatusFrame(False) is emitted after each sentence's audio.
-            The final False signals the browser that all audio is done.
-          - Between sentences, status stays True so the browser keeps showing
-            the "AI is speaking" indicator.
-
-        Note: The current design emits AIStatusFrame(False) after EVERY sentence.
-        main.py treats each False as "might be done", but the browser's audio
-        queue keeps playing. The overall speaking indicator resets only after
-        the last sentence's audio finishes playing (handled in index.html's
-        audioQueue logic).
-        """
-        try:
-            tts_text = self._truncate(text)
-            logger.info(f"TTS: synthesizing ({len(tts_text)} chars, lang={self._language}): {tts_text[:60]!r}…")
-
-            resp = await self._http.post(
-                self.SARVAM_TTS_URL,
-                headers={
-                    "api-subscription-key": self._api_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "inputs":               [tts_text],
-                    "target_language_code": self._language,
-                    "speaker":              "anushka",
-                    "model":                "bulbul:v2",
-                },
-            )
-
-            if resp.status_code != 200:
-                logger.error(f"TTS HTTP {resp.status_code}: {resp.text[:200]}")
-                return
-
-            audio_b64 = resp.json().get("audios", [""])[0]
-            if not audio_b64:
-                logger.error("TTS: empty audio in response")
-                return
-
-            wav_bytes = base64.b64decode(audio_b64)
-            logger.info(f"TTS: got {len(wav_bytes)} bytes of audio for sentence")
-
-            # Signal "AI started speaking" only on the first sentence of this turn
-            if not self._tts_active:
-                self._tts_active = True
-                await self.push_frame(AIStatusFrame(ai_speaking=True))
-
-            await self.push_frame(AIAudioFrame(audio_bytes=wav_bytes))
-            # Signal "AI finished this sentence" — browser knows more may follow
-            await self.push_frame(AIStatusFrame(ai_speaking=False))
-            self._tts_active = False   # ready to send True on next sentence if needed
-
-        except Exception as e:
-            logger.error(f"TTS error: {e}")
-            await self.push_frame(AIStatusFrame(ai_speaking=False))
-            self._tts_active = False
 
     async def cleanup(self):
         await self._http.aclose()
@@ -874,8 +1187,8 @@ class VoicePipelineManager:
 
         self._vad  = VADProcessor()
         self._stt  = SarvamSTTService(api_key=SARVAM_API_KEY)
-        self._llm  = GroqLangGraphProcessor(thread_id=self.thread_id)
         self._tts  = SarvamTTSService(api_key=SARVAM_API_KEY)
+        self._llm  = GroqLangGraphProcessor(thread_id=self.thread_id, tts_service=self._tts)
         self._sink = OutputSink(output_queue=self.output_queue)
 
         self._pipeline = Pipeline([
@@ -888,7 +1201,7 @@ class VoicePipelineManager:
 
         self._task   = PipelineTask(
             self._pipeline,
-            params=PipelineParams(allow_interruptions=True),
+            params=PipelineParams(allow_interruptions=False),
             enable_rtvi=False,
         )
         self._runner      = PipelineRunner()
@@ -929,10 +1242,13 @@ class VoicePipelineManager:
         Feature 1 (Interrupt Fix): Cancel current pipeline processing AND drain
         the output_queue so no stale TTS audio is sent to the browser afterwards.
 
-        Without draining: after interrupt, previously-synthesized WAV chunks
-        sitting in the queue would still be sent and played — confusing the user.
-        With draining: the queue is empty; browser gets clean silence immediately.
+        Also cancels any in-flight TTS background tasks so they don't push
+        audio frames after the interrupt (barge-in / manual stop).
         """
+        # Cancel in-flight TTS tasks and stop the delivery loop first,
+        # so no new frames are pushed to the queue after we drain it.
+        await self._tts.cancel_turn()
+
         await self._task.cancel()
 
         # Drain all pending output frames so stale audio/status isn't sent

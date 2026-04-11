@@ -706,47 +706,88 @@ function escapeHtml(s) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   AUDIO PLAYBACK (queued WAV chunks)
+   AUDIO PLAYBACK (queued WAV chunks — gapless scheduling)
 ═══════════════════════════════════════════════════════ */
-async function enqueueAudio(arrayBuffer) {
-  audioQueue.push(arrayBuffer.slice(0)); // copy
-  if (!audioPlaying) playNext();
+
+// nextStartTime: AudioContext clock position where the next chunk should start.
+// Updated atomically inside processAudioQueue() — never touched concurrently.
+let nextStartTime = 0;
+
+// Raw ArrayBuffer queue — chunks arrive here from the WebSocket.
+// processAudioQueue() drains it one chunk at a time so nextStartTime is
+// always updated before the next chunk's startAt is computed.
+let decodeQueue   = [];
+let queueRunning  = false;
+
+function enqueueAudio(arrayBuffer) {
+  decodeQueue.push(arrayBuffer.slice(0));
+  if (!queueRunning) {
+    queueRunning = true;
+    processAudioQueue();
+  }
 }
 
-async function playNext() {
-  if (audioQueue.length === 0) {
-    audioPlaying = false;
-    return;
-  }
-  audioPlaying = true;
+// Process chunks one at a time — decode then schedule, in arrival order.
+// Crucially, we schedule each chunk BEFORE awaiting the next decode, so the
+// AudioContext clock drives gapless playback while JS is non-blocking.
+async function processAudioQueue() {
+  while (decodeQueue.length > 0) {
+    const buf = decodeQueue.shift();
+    try {
+      if (!audioCtx || audioCtx.state === 'closed') {
+        audioCtx      = new (window.AudioContext || window.webkitAudioContext)();
+        nextStartTime = 0;
+      }
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-  const buf = audioQueue.shift();
-  try {
-    if (!audioCtx || audioCtx.state === 'closed') {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await audioCtx.decodeAudioData(buf);
+      const src     = audioCtx.createBufferSource();
+      src.buffer    = decoded;
+      src.connect(audioCtx.destination);
+
+      // Schedule this chunk to start exactly where the previous one ends.
+      // On the first chunk (or after a stop), nextStartTime is 0 so we
+      // start immediately (+ tiny 5 ms buffer for decode overhead).
+      const startAt = Math.max(audioCtx.currentTime + 0.005, nextStartTime);
+      nextStartTime = startAt + decoded.duration;
+
+      audioPlaying  = true;
+      currentSource = src;
+
+      src.onended = () => {
+        currentSource = null;
+        // Only mark done when queue is also empty — more chunks may still arrive.
+        if (decodeQueue.length === 0 && !queueRunning) {
+          audioPlaying  = false;
+          nextStartTime = 0;
+          if (aiSpeaking === false) {
+            setWaveform(isListening ? 'active' : '');
+            setStatus(isListening ? '🎤 &nbsp;Listening…' : 'Press the mic button to start talking');
+            setDot('dot-ai', false);
+            document.getElementById('interrupt-btn').disabled = true;
+          }
+        }
+      };
+
+      src.start(startAt);
+    } catch (e) {
+      console.warn('Audio decode/play error:', e);
     }
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-    const decoded = await audioCtx.decodeAudioData(buf);
-    const src = audioCtx.createBufferSource();
-    src.buffer = decoded;
-    src.connect(audioCtx.destination);
-    currentSource = src;
-    src.onended = () => { currentSource = null; playNext(); };
-    src.start(0);
-  } catch (e) {
-    console.warn('Audio decode error:', e);
-    playNext();
   }
+  // Queue drained — mark idle. onended will handle UI reset once last chunk finishes.
+  queueRunning  = false;
 }
 
 function stopAudio() {
-  audioQueue = [];
+  decodeQueue   = [];
+  audioQueue    = []; // kept for safety — no longer used for playback
+  nextStartTime = 0;
+  queueRunning  = false;
   if (currentSource) {
     try { currentSource.stop(); } catch(_) {}
     currentSource = null;
   }
-  audioPlaying = false;
+  audioPlaying  = false;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -864,14 +905,23 @@ function handleMessage(event) {
 
     case 'status':
       aiSpeaking = msg.ai_speaking;
-      setDot('dot-ai', aiSpeaking);
-      document.getElementById('interrupt-btn').disabled = !aiSpeaking;
       if (aiSpeaking) {
+        // AI started — show immediately
+        setDot('dot-ai', true);
+        document.getElementById('interrupt-btn').disabled = false;
         setWaveform('speaking');
         setStatus('🔊 &nbsp;AI is speaking…');
       } else {
-        setWaveform(isListening ? 'active' : '');
-        setStatus(isListening ? '🎤 &nbsp;Listening…' : 'Press the mic button to start talking');
+        // AI backend is done generating — but only update UI once the
+        // audio queue has also finished playing (handled in playNext()).
+        // If nothing is playing right now, update immediately.
+        if (!audioPlaying) {
+          setWaveform(isListening ? 'active' : '');
+          setStatus(isListening ? '🎤 &nbsp;Listening…' : 'Press the mic button to start talking');
+          setDot('dot-ai', false);
+          document.getElementById('interrupt-btn').disabled = true;
+        }
+        // else: scheduleChunk()'s onended handler will update UI when last chunk finishes
       }
       break;
 
