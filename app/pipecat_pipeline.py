@@ -246,7 +246,7 @@ class VADProcessor(FrameProcessor):
     # ── Silero thresholds ─────────────────────────────────────────────────────
     SPEECH_THRESHOLD     = 0.5   # Silero probability above this = speech
     MIN_SPEECH_CHUNKS    = 3     # ~0.25 s of confirmed speech before buffering
-    SILENCE_CHUNKS_NEEDED = 8   # ~0.67 s of quiet = utterance ended (normal mode)
+    SILENCE_CHUNKS_NEEDED = 5   # ~0.42 s of quiet = utterance ended (normal mode)
     SILENCE_CHUNKS_BARGEIN = 3  # Feature 4: faster end-of-speech during barge-in
     MAX_BUFFER_CHUNKS    = 80   # ~6.7 s safety cap
 

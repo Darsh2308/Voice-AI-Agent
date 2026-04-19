@@ -202,7 +202,7 @@ _SENTENCE_END_RE = re.compile(r'(?<=[.?!।॥？！])\s+|\n+')
 # splits on commas and returns multiple `audios` entries; sending a pre-split
 # chunk guarantees a single clean audio clip with no concatenation needed.
 _COMMA_RE = re.compile(r'(?<=[,;،、])\s+')
-_MIN_WORDS_BEFORE_COMMA_SPLIT = 4   # don't split "हाय, नमस्कार" but do split longer clauses
+_MIN_WORDS_BEFORE_COMMA_SPLIT = 3   # don't split "हाय, नमस्कार" but do split longer clauses
 
 
 def _flush_sentences(buffer: str):
