@@ -19,7 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY app/ ./app/
-COPY services/ ./services/
 
 # Pre-download Silero VAD model into the torch hub cache so no network
 # access is needed at runtime (avoids NO_SOCKET errors on Railway)
