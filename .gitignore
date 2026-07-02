@@ -20,6 +20,12 @@ build/
 *.wav
 *.mp3
 
+# Knowledge-base PDFs — kept local only, ingested into Qdrant Cloud separately.
+# HF Spaces rejects binaries without Xet/LFS, and the container reads the KB
+# from Qdrant at runtime, not from these files, so they don't ship.
+*.pdf
+data/
+
 # IDE
 .vscode/
 .idea/

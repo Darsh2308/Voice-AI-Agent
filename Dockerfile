@@ -19,7 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY app/ ./app/
-COPY data/ ./data/
+# Note: knowledge-base PDFs (data/, DreamSupport.pdf) are NOT copied — they are
+# ingested into Qdrant Cloud separately and the app reads the KB from Qdrant at
+# runtime, so the container needs no local PDFs.
 
 # Pre-download Silero VAD model into the torch hub cache so no network
 # access is needed at runtime (avoids NO_SOCKET errors on Railway / HF Spaces)
