@@ -1,3 +1,13 @@
+---
+title: DreamSupport
+emoji: 🎙️
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Voice AI Agent
 
 A real-time, full-duplex voice AI agent that lets you have natural voice conversations in your browser. You speak — it listens, understands, remembers, and talks back.
