@@ -6,6 +6,8 @@ colorTo: purple
 sdk: docker
 app_port: 7860
 pinned: false
+license: other
+short_description: The Self Improving Customer Support AI Voice bot
 ---
 
 # Voice AI Agent
