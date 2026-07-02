@@ -83,7 +83,7 @@ VADProcessor (Silero)  →  SarvamSTT  →  GroqLangGraphProcessor  →  SarvamT
                                 ├─ RAG gate → RetrievalPipeline (app/knowledge/retriever.py)
                                 │             → Qdrant (app/store.py)
                                 │             → multilingual-e5-small embeddings
-                                └─ Groq LLM (streaming, tools)
+                                └─ Gemini LLM (voice; streaming, tools)
 
 Offline:  DreamEngine (app/dream/engine.py) → 5 cycles (app/dream/cycles.py)
           runs only when idle; self-caps via DreamTokenBudget (app/dream/budget.py)
@@ -113,22 +113,28 @@ This is a phone call. Every turn must feel instant.
 - RAG runs in parallel with prompt build, with a 1.5s timeout guard.
 - Never add a blocking call on the per-turn hot path without a timeout.
 
-### Token budget (Groq free tier)
-The voice agent and the Dream Engine **share one Groq org budget.**
-- Per-minute (TPM) and per-day (TPD) limits both exist and are tight.
+### Token budget (separate free-tier pools)
+The voice agent (Gemini) and the Dream Engine (Groq) run on **separate providers**, so they
+draw from **independent free-tier token pools** — dreaming can no longer exhaust the live
+voice quota. Each still has real limits (per-minute and per-day) that are tight.
 - RAG is **gated** (`_should_retrieve`) — it does NOT run on chitchat. Keep it that way.
 - Injected RAG chunks are truncated and capped (`top_k=3`, 600 chars each).
-- The Dream Engine has a HARD daily cap (`DREAM_DAILY_TOKEN_BUDGET`) and will
-  stop itself before touching the voice agent's share. Never remove that guard.
+- The Dream Engine has a HARD daily cap (`DREAM_DAILY_TOKEN_BUDGET`, now the full
+  gpt-oss-120b free-tier day). It self-stops at the cap; Groq's 429 is the real backstop.
+  Keep the guard as defense-in-depth.
 - A 413 "request too large" = prompt exceeded TPM. The fix is smaller prompts,
   not a bigger model.
 
-### Models are reasoning models (GPT-OSS)
-`openai/gpt-oss-20b` spends tokens on hidden chain-of-thought BEFORE the answer.
-- Always pass `reasoning_effort="low"` on voice calls.
-- Keep `max_tokens` high enough (≥200) that the visible answer isn't starved.
-- If a call returns empty content, suspect reasoning ate the budget first.
-- All model IDs live in `config.py` (`VOICE_LLM_MODEL`, `DREAM_LLM_MODEL`).
+### Voice = Gemini (fast), Dream = gpt-oss-120b (reasoning)
+The **voice** agent runs on **Gemini Flash-Lite** via its OpenAI-compatible endpoint — it
+emits visible tokens immediately (no hidden reasoning), so first-token latency is low. The
+**Dream Engine** runs on Groq's **`gpt-oss-120b`**, a reasoning model — fine offline.
+- `reasoning_effort="low"` is a gpt-oss param, passed ONLY for gpt-oss models. Gemini's
+  endpoint rejects unknown params, so it's omitted for voice (and auto-added back if
+  `VOICE_LLM_MODEL` is pointed at a gpt-oss model).
+- Keep dream `max_tokens` high enough (≥200) that hidden reasoning doesn't starve the answer.
+- If a gpt-oss (dream) call returns empty content, suspect reasoning ate the budget first.
+- All model IDs live in `config.py` (`VOICE_LLM_MODEL`, `DREAM_LLM_MODEL`, `SARVAM_*`).
   Migrate models by editing config/.env only — never hardcode IDs in app code.
 
 ### Voice output rules

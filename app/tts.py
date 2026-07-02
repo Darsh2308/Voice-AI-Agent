@@ -2,7 +2,7 @@ import httpx
 import base64
 import os
 import tempfile
-from app.config import SARVAM_API_KEY
+from app.config import SARVAM_API_KEY, SARVAM_TTS_MODEL, SARVAM_TTS_SPEAKER
 
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 
@@ -20,8 +20,8 @@ async def text_to_speech(text: str, output_file: str = _DEFAULT_TTS_OUTPUT) -> s
     payload = {
         "inputs": [text],
         "target_language_code": "en-IN",
-        "speaker": "anushka",
-        "model": "bulbul:v2"
+        "speaker": SARVAM_TTS_SPEAKER,
+        "model": SARVAM_TTS_MODEL,
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:

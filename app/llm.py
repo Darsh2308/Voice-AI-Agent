@@ -1,11 +1,20 @@
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from loguru import logger
-from app.config import GROQ_API_KEY, VOICE_LLM_MODEL
+from app.config import GEMINI_API_KEY, GEMINI_BASE_URL, VOICE_LLM_MODEL
 
 # Legacy one-shot helper for the POST /voice REST endpoint (NOT the production
-# /ws streaming path). A 15s timeout keeps a stuck request from hanging the
-# handler far longer than a phone caller would wait.
-client = AsyncGroq(api_key=GROQ_API_KEY, timeout=15.0)
+# /ws streaming path). Uses the same voice LLM as the live path — Gemini via its
+# OpenAI-compatible endpoint. A 15s timeout keeps a stuck request from hanging
+# the handler far longer than a phone caller would wait.
+client = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL, timeout=15.0)
+
+# reasoning_effort is a gpt-oss (Groq) param; Gemini's OpenAI-compatible endpoint
+# rejects unknown params, so include it only when the voice model is gpt-oss.
+_VOICE_REASONING_KW = (
+    {"reasoning_effort": "low"}
+    if ("gpt-oss" in VOICE_LLM_MODEL.lower() or VOICE_LLM_MODEL.lower().startswith("openai/"))
+    else {}
+)
 
 # Spoken when the model returns nothing or errors, so the endpoint never crashes
 # or returns dead audio.
@@ -30,9 +39,9 @@ async def generate_response(user_text: str) -> str:
                     "content": user_text
                 }
             ],
-            reasoning_effort="low",   # GPT-OSS reasoning model — minimise overhead
+            **_VOICE_REASONING_KW,
             temperature=0.7,
-            max_tokens=200,   # raised for reasoning model headroom
+            max_tokens=200,
         )
     except Exception as exc:
         # 429/413/timeout/network — degrade gracefully instead of a 500.

@@ -61,8 +61,9 @@ toward converting — without being pushy and without inventing facts.
 
 **Design philosophy (production, not demo):**
 - Every turn must feel instant — a phone call has a hard **~1.5–2s latency budget**.
-- The voice agent and Dream Engine **share one Groq token budget**, so dreaming is
-  hard-capped and can never starve live calls.
+- The voice agent (Gemini) and the Dream Engine (Groq) run on **separate LLM providers
+  with independent free-tier pools**, so dreaming can never starve live calls. A hard
+  daily token cap on dreaming remains as defense-in-depth.
 - Every unhappy path (timeout, 429, 413, empty reply, disconnect, barge-in) is handled
   explicitly and degrades gracefully — the agent never goes silent on the customer.
 
@@ -92,7 +93,7 @@ FastAPI server (app/main.py)  ── echo cooldown · barge-in · timeout · han
 │                                    stream_agent()  (langgraph_flow.py)  │
 │                                     ├─ RAG gate → RetrievalPipeline      │
 │                                     │             → Qdrant vector search │
-│                                     └─ Groq LLM (streaming, sentences)   │
+│                                     └─ Gemini LLM (streaming, sentences) │
 │                                              │                          │
 │  ──► SarvamTTSService ──► OutputSink ────────┘                          │
 │      (Sarvam TTS)         (asyncio.Queue → send loop)                   │
@@ -135,8 +136,10 @@ emits `EmotionHintFrame("agitated")`.
 ### 2.3 SarvamSTTService — Speech to Text
 
 - Uploads the utterance WAV to **Sarvam ASR** (`POST https://api.sarvam.ai/speech-to-text`).
-- **Model `saarika:v2.5`**, `language_code="unknown"` (always auto-detect, so mid-call
-  language switches like English → Hindi → Marathi work correctly).
+- **Model `saaras:v3`** with `mode="transcribe"` (`saarika:v2.5` is legacy/deprecated),
+  `language_code="unknown"` (always auto-detect, so mid-call language switches like
+  English → Hindi → Marathi work correctly). Model + mode are config-driven
+  (`SARVAM_STT_MODEL`, `SARVAM_STT_MODE`) — `mode` applies only to `saaras:*` models.
 - **Language detection + romanized-language correction:** reads Sarvam's `language_code`,
   normalizes it to BCP-47 (`hi` → `hi-IN`, etc.). Because Sarvam often mislabels *romanized*
   Indian speech (Hinglish, romanized Marathi) as English, a **function-word marker scan**
@@ -176,11 +179,13 @@ Inside `stream_agent()`:
 ### 2.5 SarvamTTSService — Text to Speech
 
 - Synthesizes each sentence via **Sarvam TTS** (`POST https://api.sarvam.ai/text-to-speech`).
-- **Model `bulbul:v2`**, speaker **`anushka`**, `target_language_code` auto-switched by
+- **Model `bulbul:v3`**, speaker **`simran`** (config-driven via `SARVAM_TTS_MODEL` /
+  `SARVAM_TTS_SPEAKER`; note `bulbul:v3` uses its own speaker set — v2 names like
+  `anushka` are rejected), `target_language_code` auto-switched by
   `LanguageDetectedFrame` so the AI replies in the user's language.
 - **Pipeline-parallel design:** each sentence fires a **background API task immediately**;
   a separate in-order delivery loop pushes audio in arrival order as each resolves. This
-  removed the bottleneck where Groq streaming was serialized behind TTS round-trips.
+  removed the bottleneck where LLM streaming was serialized behind TTS round-trips.
 - **Pre-TTS text processing** (spoken audio only — transcript/logs keep original spelling):
   - **`num_to_words`** spells every digit into words *in the reply's language* ("two ninety
     nine rupees"), because Sarvam drops/mis-speaks bare numerals — critical for prices.
@@ -205,31 +210,39 @@ Every model in the stack, end to end:
 | Role | Model | Provider | Notes |
 |---|---|---|---|
 | **Voice Activity Detection** | Silero VAD (`silero_vad`) | torch.hub (local, CPU) | Neural speech detection + barge-in. Pre-downloaded at Docker build. |
-| **Speech-to-Text (ASR)** | `saarika:v2.5` | Sarvam AI | Auto-detects language every turn; 11 Indian languages. |
-| **LLM (live voice agent)** | `openai/gpt-oss-20b` | Groq | `VOICE_LLM_MODEL`. Fast (~1000 tok/s), 131K context, free tier. Reasoning model → `reasoning_effort="low"`. |
-| **LLM (Dream Engine)** | `openai/gpt-oss-20b` | Groq | `DREAM_LLM_MODEL`. Same model offline; quality over speed. |
-| **Text-to-Speech (TTS)** | `bulbul:v2` (speaker `anushka`) | Sarvam AI | Natural multilingual TTS; auto language switch. |
+| **Speech-to-Text (ASR)** | `saaras:v3` (`mode=transcribe`) | Sarvam AI | `SARVAM_STT_MODEL`/`SARVAM_STT_MODE`. Auto-detects language every turn; 11 Indian languages. (`saarika:v2.5` is legacy.) |
+| **LLM (live voice agent)** | `gemini-3.1-flash-lite` | Google (Gemini, OpenAI-compatible endpoint) | `VOICE_LLM_MODEL`. Fast first token (no reasoning tax), strong Indian-language + native-script, streaming + tools. |
+| **LLM (Dream Engine)** | `openai/gpt-oss-120b` | Groq | `DREAM_LLM_MODEL`. A reasoning model — an asset for offline evaluation/self-critique where latency doesn't matter. |
+| **Text-to-Speech (TTS)** | `bulbul:v3` (speaker `simran`) | Sarvam AI | `SARVAM_TTS_MODEL`/`SARVAM_TTS_SPEAKER`. Natural multilingual TTS; auto language switch. |
 | **Embeddings (RAG)** | `intfloat/multilingual-e5-small` | sentence-transformers (local, CPU) | **384-dim**, multilingual. Free, runs on CPU. Pre-downloaded at build. |
 | **Reranker (optional, off)** | `cross-encoder/ms-marco-MiniLM-L-6-v2` | sentence-transformers | Enable with `RERANKER=true`. |
 
-> **Model migration:** all LLM IDs live in `app/config.py` (`VOICE_LLM_MODEL`,
-> `DREAM_LLM_MODEL`). Change them via config/`.env` only — never hardcode IDs in app code.
+> **Model migration:** all model IDs live in `app/config.py` (`VOICE_LLM_MODEL`,
+> `DREAM_LLM_MODEL`, `SARVAM_STT_MODEL`, `SARVAM_TTS_MODEL`, `SARVAM_TTS_SPEAKER`). Change
+> them via config/`.env` only — never hardcode IDs in app code.
 
-**Why GPT-OSS-20B?** Groq deprecated `llama-3.1-8b-instant` and `llama-3.3-70b-versatile`
-(decommissioned 2026-08-16). GPT-OSS-20B is the recommended free-tier replacement: fastest on
-Groq, cheapest, 131K context. It is a **reasoning model** — it spends tokens on hidden
-chain-of-thought *before* the visible answer, which is why we always pass
-`reasoning_effort="low"` and keep `max_tokens` high enough that the answer isn't starved.
+**Why separate providers for voice and dream?** The two workloads have opposite needs.
+The **voice** path is latency-critical and short-form, so it uses **Gemini Flash-Lite** — it
+emits visible tokens immediately (no hidden-reasoning delay) and handles Indian languages /
+native script well. The **Dream Engine** is offline and reasoning-heavy (grading turns,
+judging prompt proposals), so it uses Groq's **`gpt-oss-120b`**, a reasoning model where
+latency is irrelevant and depth is an asset. Running them on **different providers** also
+makes their free-tier token pools independent — dreaming can never exhaust the live voice
+quota. `reasoning_effort="low"` is passed **only** for gpt-oss models (Gemini's
+OpenAI-compatible endpoint rejects the param); it re-appears automatically if
+`VOICE_LLM_MODEL` is ever pointed back at a gpt-oss model.
 
 ### LLM call parameters
 
-| Call | Temperature | max_tokens | reasoning_effort | Streaming |
-|---|---|---|---|---|
-| Voice — first call | 0.5 | 200 | low | yes |
-| Voice — follow-up after tool | 0.7 | 250 | low | yes |
-| Conversation summarization | 0.3 | 300 | low | no |
-| Dream Engine (JSON eval) | 0.3 | 512 (default) | low | no |
-| Dream Engine (text) | 0.4 | 256 (default) | low | no |
+| Call | Provider | Temperature | max_tokens | reasoning_effort | Streaming |
+|---|---|---|---|---|---|
+| Voice — first call | Gemini | 0.5 | 200 | n/a¹ | yes |
+| Voice — follow-up after tool | Gemini | 0.7 | 250 | n/a¹ | yes |
+| Conversation summarization | Gemini | 0.3 | 300 | n/a¹ | no |
+| Dream Engine (JSON eval) | Groq | 0.3 | 512 (default) | low | no |
+| Dream Engine (text) | Groq | 0.4 | 256 (default) | low | no |
+
+¹ `reasoning_effort` is a gpt-oss param; it's omitted for Gemini and auto-included only if the voice model is switched back to a gpt-oss model.
 
 ---
 
@@ -355,14 +368,16 @@ sessions), flags KB documents never retrieved, and cleans up old synthetic turns
 
 ### 5.3 The safety guard — daily token budget (`app/dream/budget.py`)
 
-The Dream Engine and the live voice agent **share one Groq org token budget** (free tier
-~100K/day). `DreamTokenBudget` enforces a hard cap so dreaming can never starve live calls:
+The Dream Engine runs on Groq's `gpt-oss-120b`. Since the voice agent now runs on a
+**separate provider** (Gemini), dreaming no longer shares a token budget with live calls —
+so it gets the **full gpt-oss-120b free-tier day** (~200K tokens). `DreamTokenBudget`
+remains as a safety ceiling (Groq's own 429 is the real backstop):
 - **Before every LLM call:** `can_afford()` checks a conservative estimate against the cap;
   over-cap raises `_BudgetExhausted` and the whole run stops.
 - **After every call:** records the *actual* Groq-reported tokens and **persists the running
   total to Qdrant**, so a mid-day restart doesn't reset the cap.
 - **Resets** automatically at the UTC day rollover.
-- Cap: **`DREAM_DAILY_TOKEN_BUDGET = 50000`** (~50% of the free tier). Lower it to protect voice further.
+- Cap: **`DREAM_DAILY_TOKEN_BUDGET = 200000`** (full free-tier day). Lower it to make dreaming do less per day.
 
 `_BudgetExhausted` and `_RateLimitHit` inherit from `BaseException` on purpose, so the cycles'
 many `except Exception` blocks can't swallow them — they bubble straight to the engine, which
@@ -430,9 +445,9 @@ This system's CLAUDE.md records real hours lost to subtle failures. Here's every
 | Edge case | Guard |
 |---|---|
 | **413 "request too large" (prompt > TPM)** | Retry once with the RAG context stripped — smaller prompt, not a bigger model. |
-| **429 rate-limit (live)** | Sleep 1.5s, retry once; if still failing, fall through to the fallback phrase. |
-| **Empty reply (reasoning ate the budget)** | Detected and replaced with a **localized fallback phrase** in the user's language (11 languages). |
-| **Reasoning model overhead** | `reasoning_effort="low"` on every call; `max_tokens` kept high enough for the visible answer. |
+| **429 / quota exhausted (live voice)** | Sleep 1.5s, retry once; if it still fails, the free tier is likely exhausted → the agent **speaks a localized "we're at capacity, try again shortly" message** (distinct from "didn't catch that"), never dead air. |
+| **Empty reply (model returned nothing)** | Detected and replaced with a **localized fallback phrase** in the user's language (11 languages). |
+| **Reasoning overhead (Dream / Groq only)** | `reasoning_effort="low"` on gpt-oss calls; omitted for Gemini (voice), which has no hidden-reasoning phase. |
 | **Prompt bloat from Dream addenda** | Approved addenda capped at **3 per prompt** (an unbounded list caused a 413). |
 | **RAG slow on the hot path** | RAG runs in parallel with a **1.5s timeout**; the turn proceeds without it if it's late. |
 | **RAG wasting tokens on chitchat** | `_should_retrieve` gate skips retrieval for confirmations/greetings. |
@@ -442,7 +457,7 @@ This system's CLAUDE.md records real hours lost to subtle failures. Here's every
 ### Dream Engine edge cases
 | Edge case | Guard |
 |---|---|
-| **Dreaming starving live calls** | Hard daily token cap (`DREAM_DAILY_TOKEN_BUDGET`), persisted across restarts, UTC-daily reset. |
+| **Dreaming starving live calls** | Separate provider from voice (independent free-tier pools) + a hard daily token cap (`DREAM_DAILY_TOKEN_BUDGET`), persisted across restarts, UTC-daily reset. |
 | **Groq 429 during a cycle** | Class-level circuit breaker aborts the run; engine backs off **1 hour** (limit resets daily, so retrying every minute just spams 429s). |
 | **Control-flow signals swallowed** | `_BudgetExhausted` / `_RateLimitHit` inherit `BaseException` so `except Exception` can't eat them. |
 | **Re-analyzing the same turns** | Per-cycle processed markers + `dream_processed` flag (Bug #8). |
@@ -488,13 +503,17 @@ All configuration lives in `app/config.py` and is env-driven (`.env`). Defaults 
 | Variable | Default | Purpose |
 |---|---|---|
 | `SARVAM_API_KEY` | — | Sarvam ASR + TTS (required). |
-| `GROQ_API_KEY` | — | Groq LLM (required). |
+| `GEMINI_API_KEY` | — | Gemini voice LLM (required). Free at aistudio.google.com — keep on a no-billing project so the free tier stays active. |
+| `GEMINI_BASE_URL` | `…/v1beta/openai` | Gemini OpenAI-compatible endpoint base URL. |
+| `GROQ_API_KEY` | — | Groq — Dream Engine LLM (required for dreaming). |
 | `QDRANT_URL` / `QDRANT_API_KEY` | — | Qdrant Cloud (optional; enables RAG + Dream Engine). |
-| `VOICE_LLM_MODEL` | `openai/gpt-oss-20b` | Live voice agent model. |
-| `DREAM_LLM_MODEL` | `openai/gpt-oss-20b` | Dream Engine model. |
+| `VOICE_LLM_MODEL` | `gemini-3.1-flash-lite` | Live voice agent model (Gemini). |
+| `DREAM_LLM_MODEL` | `openai/gpt-oss-120b` | Dream Engine model (Groq). |
+| `SARVAM_STT_MODEL` / `SARVAM_STT_MODE` | `saaras:v3` / `transcribe` | Sarvam STT model + mode (`mode` applies only to `saaras:*`). |
+| `SARVAM_TTS_MODEL` / `SARVAM_TTS_SPEAKER` | `bulbul:v3` / `simran` | Sarvam TTS model + speaker (speaker must be valid for the model). |
 | `DREAM_IDLE_THRESHOLD_SECS` | `300` | Idle time before dreaming starts. |
 | `DREAM_CYCLE_INTERVAL_SECS` | `300` | Pause between dream cycles. |
-| `DREAM_DAILY_TOKEN_BUDGET` | `50000` | Hard daily token cap for dreaming. |
+| `DREAM_DAILY_TOKEN_BUDGET` | `200000` | Hard daily token cap for dreaming (full gpt-oss-120b free-tier day). |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | RAG embedding model. |
 | `EMBEDDING_DIM` | `384` | Embedding dimension. |
 | `EMBEDDING_PROVIDER` | `local` | `local` (sentence-transformers) or `openai`. |
@@ -511,7 +530,7 @@ All configuration lives in `app/config.py` and is env-driven (`.env`). Defaults 
 ### Prerequisites
 - Python 3.10+ (3.11 in Docker)
 - A modern browser with mic access (Chrome recommended — WebRTC echo cancellation)
-- API keys: **Sarvam** (ASR + TTS), **Groq** (LLM); optional **Qdrant Cloud** for RAG + Dream Engine.
+- API keys: **Sarvam** (ASR + TTS), **Gemini** (voice LLM), **Groq** (Dream Engine LLM); optional **Qdrant Cloud** for RAG + Dream Engine.
 
 ### Local run
 ```bash
@@ -520,7 +539,7 @@ python -m venv .venv
 # source .venv/bin/activate       # macOS/Linux
 pip install -r requirements.txt
 
-# .env with SARVAM_API_KEY, GROQ_API_KEY, (optional) QDRANT_URL/QDRANT_API_KEY
+# .env with SARVAM_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, (optional) QDRANT_URL/QDRANT_API_KEY
 python -m app.knowledge.ingestor   # one-time: load the KB into Qdrant (if using RAG)
 
 # IMPORTANT: do NOT use --reload on the OneDrive-synced folder (runs stale code)
@@ -531,7 +550,7 @@ Open `http://localhost:8000`, click **Start Listening**, and talk.
 ### Verify a change (per project rules)
 ```bash
 .venv/Scripts/python.exe -m py_compile app/<file>.py    # compiles ≠ works
-# For Groq changes, make a real streaming call and inspect usage.total_tokens + content.
+# For LLM changes, make a real streaming call and inspect the streamed content (+ usage.total_tokens for Groq/dream).
 ```
 
 ### Deployment (Hugging Face Spaces / Docker)
@@ -632,9 +651,10 @@ Voice-AI-Agent/
 | Web framework / server | FastAPI + Uvicorn |
 | Voice pipeline | Pipecat (frame-based) |
 | VAD | Silero VAD (PyTorch, CPU) |
-| ASR | Sarvam `saarika:v2.5` |
-| LLM | Groq `openai/gpt-oss-20b` (voice + dream) |
-| TTS | Sarvam `bulbul:v2` (speaker `anushka`) |
+| ASR | Sarvam `saaras:v3` (`mode=transcribe`) |
+| LLM (voice) | Gemini `gemini-3.1-flash-lite` (OpenAI-compatible endpoint) |
+| LLM (dream) | Groq `openai/gpt-oss-120b` |
+| TTS | Sarvam `bulbul:v3` (speaker `simran`) |
 | Agent / memory | LangGraph + MemorySaver |
 | Vector DB | Qdrant Cloud |
 | Embeddings | `intfloat/multilingual-e5-small` (sentence-transformers, 384-d) |
