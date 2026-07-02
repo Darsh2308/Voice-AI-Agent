@@ -1,0 +1,38 @@
+# Environment variables
+.env
+
+# Frontend (kept local only)
+# index.html
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Temp files
+*.wav
+*.mp3
+
+# Knowledge-base PDFs — kept local only, ingested into Qdrant Cloud separately.
+# HF Spaces rejects binaries without Xet/LFS, and the container reads the KB
+# from Qdrant at runtime, not from these files, so they don't ship.
+*.pdf
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+.claude/
+info.md
