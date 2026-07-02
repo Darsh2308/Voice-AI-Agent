@@ -66,11 +66,14 @@ import asyncio
 import base64
 import io
 import os
+import re
 import tempfile
+import time
 import torch
 import uuid
 import wave
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 
 import httpx
 from loguru import logger
@@ -91,6 +94,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 
 from app.config import SARVAM_API_KEY
+from app.num_to_words import spell_digits as _spell_digits
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load Silero VAD model once at module level (not per-connection)
@@ -212,6 +216,19 @@ class LLMTurnDoneFrame(Frame):
     pass
 
 
+class EndCallFrame(Frame):
+    """
+    Agent-initiated hangup. Emitted by GroqLangGraphProcessor AFTER the goodbye
+    turn's audio has been delivered, when stream_agent reported _meta_out
+    ["end_call"]=True (the LLM appended [END_CALL] to its final message).
+
+    main.py's send_loop receives this from OutputSink and closes the WebSocket
+    — but only after the goodbye audio has been flushed to the browser, so the
+    customer always hears the farewell before the line drops.
+    """
+    pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  VADProcessor  (Voice Activity Detection — Silero VAD)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,11 +261,25 @@ class VADProcessor(FrameProcessor):
     """
 
     # ── Silero thresholds ─────────────────────────────────────────────────────
+    # Each browser frame ≈ 85 ms (4096 samples @ ~48 kHz), so chunk counts below
+    # translate roughly: 1 chunk ≈ 85 ms, 2 ≈ 170 ms, 3 ≈ 255 ms.
     SPEECH_THRESHOLD     = 0.5   # Silero probability above this = speech
-    MIN_SPEECH_CHUNKS    = 3     # ~0.25 s of confirmed speech before buffering
-    SILENCE_CHUNKS_NEEDED = 5   # ~0.42 s of quiet = utterance ended (normal mode)
-    SILENCE_CHUNKS_BARGEIN = 3  # Feature 4: faster end-of-speech during barge-in
-    MAX_BUFFER_CHUNKS    = 80   # ~6.7 s safety cap
+    MIN_SPEECH_CHUNKS    = 3     # ~0.25 s of confirmed speech before buffering (normal turns)
+    # Barge-in must feel like real conversation: the instant the user speaks over
+    # the AI, stop. Fire after just 2 confirmed speech chunks (~170 ms) instead of
+    # 3 — fast enough to feel instant, still enough to reject a single-chunk noise
+    # blip. Normal (non-barge-in) detection keeps 3 to avoid false starts on the
+    # user's own turns.
+    MIN_SPEECH_CHUNKS_BARGEIN = 2
+    # End-of-utterance silence window. 0.42 s was too aggressive — a natural
+    # mid-sentence "thinking" pause (e.g. "…but I want to … switch") exceeded it,
+    # so the agent cut the customer off. 12 chunks ≈ 1.0 s lets people pause to
+    # think without being interrupted, while still feeling responsive once they
+    # actually stop. Barge-in stays snappy (it only ends an already-detected
+    # interruption, where the user is clearly committed to speaking).
+    SILENCE_CHUNKS_NEEDED = 12  # ~1.0 s of quiet = utterance ended (normal mode)
+    SILENCE_CHUNKS_BARGEIN = 4  # Feature 4: faster end-of-speech during barge-in
+    MAX_BUFFER_CHUNKS    = 180  # ~15 s safety cap (longer sentences now allowed)
 
     # ── Sample rate constants ─────────────────────────────────────────────────
     TARGET_SAMPLE_RATE   = 16000  # Silero and Sarvam ASR both expect 16 kHz
@@ -364,24 +395,36 @@ class VADProcessor(FrameProcessor):
     async def _process_audio_chunk(self, raw_pcm: bytes):
         """Run one chunk of browser audio through the Silero VAD state machine."""
         pcm_16k = self._resample(raw_pcm)
-        prob    = self._speech_prob(pcm_16k)
+        # Silero inference is CPU-bound torch work (~12×/sec). Running it inline
+        # blocked the event loop, adding jitter to audio delivery and slowing
+        # barge-in during playback (Bug #10). Offload to the default thread pool
+        # so the loop stays free for WebSocket/HTTP I/O. Safe because chunks are
+        # processed strictly one at a time (process_frame awaits each in order),
+        # so the _silero_leftover state carried across calls is never raced.
+        loop = asyncio.get_running_loop()
+        prob = await loop.run_in_executor(None, self._speech_prob, pcm_16k)
 
         if prob >= self.SPEECH_THRESHOLD:
             # ── SPEECH chunk ─────────────────────────────────────────────────
             self._silence_chunk_count = 0
             self._audio_buffer.append(pcm_16k)
+            self._speech_chunks_seen += 1
+
+            # Feature 4: BARGE-IN — fire as soon as the user speaks OVER the AI,
+            # at a lower threshold (~170 ms) than normal utterance detection, so
+            # interruption feels like real conversation. Decoupled from the
+            # _is_speech_active gate below (which needs more chunks) — waiting for
+            # that made barge-in sluggish.
+            if (self._barge_in_mode and not self._barge_in_signaled
+                    and self._speech_chunks_seen >= self.MIN_SPEECH_CHUNKS_BARGEIN):
+                self._barge_in_signaled = True
+                logger.info(f"VAD: BARGE-IN fired after {self._speech_chunks_seen} chunks (prob={prob:.2f})")
+                await self.push_frame(BargeInDetectedFrame())
 
             if not self._is_speech_active:
-                self._speech_chunks_seen += 1
                 if self._speech_chunks_seen >= self.MIN_SPEECH_CHUNKS:
                     self._is_speech_active = True
                     logger.debug(f"VAD: speech STARTED (prob={prob:.2f}, barge_in={self._barge_in_mode})")
-
-                    # Feature 4: Emit barge-in signal the moment speech is confirmed
-                    # while AI is speaking. main.py will interrupt the AI immediately.
-                    if self._barge_in_mode and not self._barge_in_signaled:
-                        self._barge_in_signaled = True
-                        await self.push_frame(BargeInDetectedFrame())
 
             # Feature 10: track energy during active speech
             if self._is_speech_active:
@@ -678,13 +721,35 @@ class GroqLangGraphProcessor(FrameProcessor):
     the TTS pipeline to start synthesizing immediately.
     """
 
-    def __init__(self, thread_id: str, tts_service=None, **kwargs):
+    def __init__(
+        self,
+        thread_id:   str,
+        tts_service  = None,
+        session_id:  Optional[str] = None,
+        trace_store  = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._thread_id    = thread_id
-        self._emotion_hint = "neutral"   # Feature 10: updated by EmotionHintFrame
-        self._language     = "en-IN"     # updated by LanguageDetectedFrame each turn
-        self._tts          = tts_service # reference to SarvamTTSService for flush()
-        logger.info(f"GroqLangGraphProcessor: thread_id={thread_id}")
+        # Thread ids superseded by reset_thread() this connection — deleted from
+        # the checkpointer on disconnect so their in-RAM state doesn't leak.
+        self._retired_thread_ids: list[str] = []
+        self._emotion_hint = "neutral"
+        self._language     = "en-IN"
+        self._tts          = tts_service
+        # Phase 3: trace recording
+        self._session_id   = session_id or str(uuid.uuid4())
+        self._trace_store  = trace_store   # ExecutionTraceStore | None
+        self._turn_index   = 0
+        # Serialize _generate so the detached opening greeting and a user turn
+        # that arrives during it can't run concurrently and corrupt shared
+        # per-turn LLM/TTS state (_emotion_hint, _turn_index, TTS turn machinery)
+        # (Bug #15).
+        self._generate_lock = asyncio.Lock()
+        logger.info(
+            f"GroqLangGraphProcessor: thread_id={thread_id} "
+            f"session_id={self._session_id[:8]}… trace={'on' if trace_store else 'off'}"
+        )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -710,73 +775,182 @@ class GroqLangGraphProcessor(FrameProcessor):
 
     async def _generate(self, user_text: str):
         """
+        Serialized entry point for a turn. The lock ensures the detached opening
+        greeting and any user turn that arrives during it run one-at-a-time, so
+        they can't interleave TextFrames into the same TTS turn or race the
+        shared _emotion_hint/_turn_index state (Bug #15).
+        """
+        async with self._generate_lock:
+            await self._generate_impl(user_text)
+
+    async def _generate_impl(self, user_text: str):
+        """
         Stream user text through LangGraph + Groq, emitting one TextFrame
         per sentence for immediate TTS synthesis.
 
+        Phase 3: wraps the call with wall-clock timing and records a TurnTrace
+        into Qdrant after every turn via ExecutionTraceStore.
+
         Flow:
-          1. Emit AIThinkingFrame(True)  → browser shows "AI is thinking…"
-          2. Call stream_agent() which streams sentences from the LLM
-          3. On first sentence: emit AIThinkingFrame(False) to hide thinking dots
-          4. Push each sentence as TextFrame → TTS synthesizes immediately
-          5. In `finally`: always emit full TranscriptDisplayFrame for chat log
-             — even if _save_turn() inside stream_agent raises an exception.
-          6. Reset emotion_hint to neutral
+          1. Emit AIThinkingFrame(True)
+          2. Start timer
+          3. Call stream_agent() — RAG context injected inside stream_agent (Phase 2)
+          4. On first sentence: emit AIThinkingFrame(False)
+          5. Push each sentence as TextFrame → TTS
+          6. In finally: emit TranscriptDisplayFrame + record TurnTrace
+          7. Reset emotion_hint to neutral
+          8. Push LLMTurnDoneFrame sentinel
         """
         from app.langgraph_flow import stream_agent
+        from app.tracing.trace_store import TurnTrace
 
         logger.info(f"LangGraph streaming: thread={self._thread_id[:8]}… input={user_text!r}")
 
-        # Feature 6: signal to browser that we're thinking
         await self.push_frame(AIThinkingFrame(thinking=True))
 
         full_text      = ""
         first_sentence = True
+        meta_out: dict = {}          # Phase 2+3: populated by stream_agent
+        start_time     = time.monotonic()
 
         try:
-            async for sentence in stream_agent(user_text, self._thread_id, self._emotion_hint, self._language):
+            async for sentence in stream_agent(
+                user_text,
+                self._thread_id,
+                self._emotion_hint,
+                self._language,
+                _meta_out=meta_out,
+            ):
                 if not sentence.strip():
                     continue
 
                 if first_sentence:
-                    # Feature 6: hide thinking dots as soon as we have the first sentence
                     await self.push_frame(AIThinkingFrame(thinking=False))
                     first_sentence = False
 
                 full_text += sentence.strip() + " "
                 logger.info(f"LLM→TTS: pushing TextFrame → {sentence.strip()!r}")
-                # Feature 3: push each sentence to TTS immediately
                 await self.push_frame(TextFrame(text=sentence.strip()))
 
         except Exception as e:
             logger.error(f"LangGraph streaming error: {e}")
 
         finally:
-            # Always hide the thinking indicator (even if an error occurred)
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+
             if first_sentence:
                 await self.push_frame(AIThinkingFrame(thinking=False))
 
-            # Always show the AI text in the chat, even if state-save failed.
-            # This was the root cause of missing AI text bubbles: an exception
-            # from _save_turn() inside stream_agent() was caught here and caused
-            # an early return before TranscriptDisplayFrame was pushed.
             if full_text.strip():
                 await self.push_frame(TranscriptDisplayFrame(text=full_text.strip(), speaker="ai"))
 
-        # Reset emotion hint after use — next turn starts neutral
+            # Phase 3: record turn trace
+            if self._trace_store is not None:
+                try:
+                    trace = TurnTrace(
+                        session_id        = self._session_id,
+                        turn_index        = self._turn_index,
+                        user_input        = user_text,
+                        detected_language = self._language,
+                        retrieved_docs    = meta_out.get("retrieved_docs", []),
+                        tool_calls        = meta_out.get("tool_calls",     []),
+                        ai_response       = full_text.strip(),
+                        latency_ms        = latency_ms,
+                        emotion_hint      = self._emotion_hint,
+                        created_at        = datetime.now(timezone.utc).isoformat(),
+                    )
+                    # Bound the Qdrant upsert: it sits on the turn-completion
+                    # path just before LLMTurnDoneFrame/EndCallFrame, so a slow
+                    # Qdrant would inject dead time between reply-end and
+                    # turn/hangup completion (Bug #14). Cap it at 1s; on timeout
+                    # we skip persistence for this turn rather than stall the call.
+                    self._turn_index += 1
+                    await asyncio.wait_for(self._trace_store.record_turn(trace), timeout=1.0)
+                except asyncio.TimeoutError:
+                    logger.warning("TraceStore.record_turn timed out (>1s) — skipping trace for this turn")
+                except Exception as trace_exc:
+                    logger.error(f"TraceStore.record_turn failed (non-fatal): {trace_exc}")
+
         self._emotion_hint = "neutral"
 
-        # Push the sentinel THROUGH the pipeline so it arrives at SarvamTTSService
-        # only AFTER all the TextFrames from this turn have been processed.
-        # This fixes the race where the old flush() call happened before the last
-        # TextFrame reached SarvamTTSService.process_frame.
         logger.info("LLM: pushing LLMTurnDoneFrame sentinel downstream")
         await self.push_frame(LLMTurnDoneFrame())
+
+        # Agent-initiated hangup: if the LLM signalled [END_CALL] this turn,
+        # push EndCallFrame AFTER LLMTurnDoneFrame so it arrives in-order behind
+        # the goodbye audio. The TTS service forwards it to OutputSink only once
+        # this turn's audio has been delivered, so the farewell is always heard.
+        if meta_out.get("end_call"):
+            logger.info("LLM: agent requested end-of-call — pushing EndCallFrame")
+            await self.push_frame(EndCallFrame())
 
     def reset_thread(self):
         """Start a new conversation by assigning a new thread_id."""
         old = self._thread_id
+        # Remember the retired thread so its checkpointer state is deleted on
+        # disconnect — otherwise reset() leaks the old conversation in RAM.
+        self._retired_thread_ids.append(old)
         self._thread_id = str(uuid.uuid4())
         logger.info(f"LangGraph: thread reset {old[:8]}→{self._thread_id[:8]}")
+
+    async def cleanup_threads(self):
+        """
+        Delete this connection's checkpointer state (current + any retired
+        thread ids) on disconnect so the global in-RAM MemorySaver doesn't grow
+        without bound. Non-fatal: a failed delete is logged, not raised.
+        """
+        from app.memory import checkpointer
+        for tid in [*self._retired_thread_ids, self._thread_id]:
+            try:
+                await checkpointer.adelete_thread(tid)
+            except Exception as exc:
+                logger.warning(f"cleanup_threads: delete {tid[:8]}… failed (non-fatal): {exc}")
+        self._retired_thread_ids.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TTS pronunciation normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+# (regex, replacement) pairs applied to text JUST before it goes to Sarvam TTS.
+# Fixes brand/product names the TTS mispronounces. Spoken-only — transcript and
+# logs keep the original spelling. \b = whole-word, re.IGNORECASE = any casing.
+#
+# To add a term: append (re.compile(r"\bWORD\b", re.IGNORECASE), "phonetic").
+#
+# WHY DEVANAGARI: Sarvam bulbul:v2 with target_language_code="en-IN" applies
+# English grapheme-to-phoneme rules to Roman text, so "Bharat"/"Suhas" get
+# anglicised (wrong aspiration + vowels). Feeding the word in Devanagari routes
+# it through the Indic phoneme set and it reads natively — even inside an
+# otherwise-English sentence (mixed-script input is supported; verified by ear).
+_TTS_PRONUNCIATION_MAP = [
+    # Brand: "BharatConnect"/"Bharat Connect"/"BharatConnect's" → full Devanagari
+    # "भारत कनेक्ट". Keeping "Connect" in Roman mid-phrase made the TTS switch out
+    # of Indic mode and garble it; writing the WHOLE brand in one script fixes the
+    # pronunciation (verified by ear).
+    (re.compile(r"\bBharat[\s-]?Connect\b", re.IGNORECASE), "भारत कनेक्ट"),
+    # Agent name — Devanagari gives the correct "su-HAAS", not English "soo-HASS".
+    (re.compile(r"\bSuha+s\b", re.IGNORECASE), "सुहास"),
+    # Competitors — Devanagari for native pronunciation.
+    (re.compile(r"\bJio\b", re.IGNORECASE), "जियो"),
+    (re.compile(r"\bAirtel\b", re.IGNORECASE), "एयरटेल"),
+    (re.compile(r"\bVodafone\b", re.IGNORECASE), "वोडाफ़ोन"),
+    (re.compile(r"\bTeleNova\b", re.IGNORECASE), "टेलीनोवा"),
+    (re.compile(r"\bBSNL\b"), "B S N L"),                    # spell the acronym
+    (re.compile(r"\bVi\b"), "V I"),                          # Vi (Vodafone Idea) → "V I"
+    (re.compile(r"\bVoLTE\b", re.IGNORECASE), "V O L T E"),  # acronym — spell it, don't say "volte"
+    # Cities — Devanagari for correct Indic pronunciation.
+    (re.compile(r"\bBengaluru\b", re.IGNORECASE), "बेंगलुरु"),
+    (re.compile(r"\bChennai\b", re.IGNORECASE), "चेन्नई"),
+    (re.compile(r"\bBihar\b", re.IGNORECASE), "बिहार"),
+    (re.compile(r"\bDelhi\b", re.IGNORECASE), "दिल्ली"),     # "Delhi NCR" → "दिल्ली NCR" (NCR stays Roman)
+    # CEO name.
+    (re.compile(r"\bAnanya\s+Deshpande\b", re.IGNORECASE), "अनन्या देशपांडे"),
+    # Terms.
+    (re.compile(r"\bAadhaar\b", re.IGNORECASE), "आधार"),
+    # Product term: British "fibre" sometimes reads oddly; normalise to "fiber".
+    # Also the standalone product word "Fiber" reads better in Devanagari.
+    (re.compile(r"\bfib(?:re|er)\b", re.IGNORECASE), "फ़ाइबर"),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -858,6 +1032,10 @@ class SarvamTTSService(FrameProcessor):
         self._http             = httpx.AsyncClient(timeout=30.0)
         self._language         = "en-IN"   # Feature 7: updated by LanguageDetectedFrame
         self._tts_active       = False
+        # Agent-initiated hangup: set True when an EndCallFrame arrives for the
+        # current turn. The delivery loop emits EndCallFrame downstream only
+        # AFTER the last audio chunk, so the goodbye is heard before the hangup.
+        self._end_call_pending = False
         # In-order delivery: list of futures in arrival order
         self._pending: list    = []
         self._delivery_task    = None
@@ -912,6 +1090,13 @@ class SarvamTTSService(FrameProcessor):
             if self._llm_done is not None:
                 self._llm_done.set()
 
+        elif isinstance(frame, EndCallFrame):
+            # Do NOT forward yet — the goodbye audio is still being delivered
+            # asynchronously by _deliver_in_order(). Mark it pending; the
+            # delivery loop emits EndCallFrame after the final audio chunk.
+            logger.info("TTS: EndCallFrame received — will hang up after goodbye audio")
+            self._end_call_pending = True
+
         elif isinstance(frame, LanguageDetectedFrame):
             self._language = frame.language_code
             logger.info(f"TTS: language switched to {frame.language_code!r}")
@@ -926,7 +1111,11 @@ class SarvamTTSService(FrameProcessor):
         """Call Sarvam TTS and resolve *fut* with WAV bytes (or None on error)."""
         chunk_id = id(fut)
         try:
-            tts_text = self._truncate(text)
+            # Spell out digits BEFORE pronunciation/truncation: Sarvam drops or
+            # mis-speaks bare numerals (esp. Devanagari "६५"), so convert them to
+            # words in this turn's language so prices are always heard.
+            spoken = _spell_digits(text, language)
+            tts_text = self._truncate(self._normalize_pronunciation(spoken))
             logger.info(f"TTS[{chunk_id}]: START request text={tts_text!r} lang={language!r}")
 
             resp = await self._http.post(
@@ -1048,12 +1237,28 @@ class SarvamTTSService(FrameProcessor):
             logger.error(f"TTS delivery error: {e}")
         finally:
             logger.info(f"TTS delivery: loop exiting — delivered {chunk_n} chunks, tts_active={self._tts_active}")
-            if self._tts_active:
+            # Emit AIStatusFrame(False) if we EVER signalled speaking (normal case)
+            # OR if this turn processed chunks but delivered no audio at all
+            # (total TTS failure — every chunk resolved None). Without the latter,
+            # a fully-failed turn emitted no status frame and the client was left
+            # stuck showing "thinking" with no degradation cue (Bug #16). `first`
+            # is still True iff nothing was ever delivered.
+            total_failure = first and chunk_n > 0
+            if self._tts_active or total_failure:
+                if total_failure:
+                    logger.warning("TTS delivery: all chunks failed — emitting AIStatusFrame(False) so client recovers")
                 await self.push_frame(AIStatusFrame(ai_speaking=False))
             self._tts_active = False
             # Clear only this turn's pending list — NOT self._pending, which
             # may have already been replaced by a new turn's list object.
             my_pending.clear()
+
+            # Agent-initiated hangup: now that the goodbye audio has been fully
+            # delivered, forward EndCallFrame so main.py closes the WebSocket.
+            if self._end_call_pending:
+                self._end_call_pending = False
+                logger.info("TTS delivery: goodbye delivered — forwarding EndCallFrame downstream")
+                await self.push_frame(EndCallFrame())
 
     # ── Called by GroqLangGraphProcessor when the LLM turn is complete ────────
 
@@ -1098,8 +1303,30 @@ class SarvamTTSService(FrameProcessor):
                 pass
 
         self._tts_active = False
-        if self._llm_done is not None:
-            self._llm_done.clear()
+        # Reset to the pristine "no turn in progress" state so the NEXT TextFrame
+        # is detected as a fresh turn (new_turn keys off _llm_done is None or
+        # is_set() in process_frame). Clearing it instead would leave it unset-but-
+        # not-None, so the next turn would be mistaken for a continuation of this
+        # cancelled one and its audio would never be delivered — the bug that made
+        # the agent go silent after a barge-in.
+        self._llm_done      = None
+        self._pending       = []
+        self._delivery_task = None
+
+    def _normalize_pronunciation(self, text: str) -> str:
+        """
+        Rewrite hard-to-pronounce brand/product terms into phonetic spellings
+        Sarvam TTS handles cleanly. This affects ONLY the spoken audio — the
+        displayed transcript and logs keep the original spelling.
+
+        The model often writes the brand as "BharatConnect" (one camelCase word)
+        which the TTS mangles; "Bharat Connect" (two words) reads correctly.
+        Competitor names and "fibre/fiber" are normalised the same way.
+        Case-insensitive, whole-word matches only.
+        """
+        for pattern, replacement in _TTS_PRONUNCIATION_MAP:
+            text = pattern.sub(replacement, text)
+        return text
 
     def _truncate(self, text: str) -> str:
         """Keep text within Sarvam's per-item character limit."""
@@ -1155,6 +1382,7 @@ class OutputSink(FrameProcessor):
             AIThinkingFrame,        # Feature 6
             LanguageDetectedFrame,  # Feature 7
             BargeInDetectedFrame,   # Feature 4
+            EndCallFrame,           # Agent-initiated hangup
             EndFrame,
         )):
             await self._q.put(frame)
@@ -1180,15 +1408,28 @@ class VoicePipelineManager:
     Each WebSocket gets its own isolated instance with its own memory.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        session_id:  Optional[str] = None,
+        trace_store  = None,
+    ):
         self.output_queue: asyncio.Queue = asyncio.Queue()
-        self.thread_id: str = str(uuid.uuid4())
-        logger.info(f"VoicePipelineManager: new session thread_id={self.thread_id[:8]}…")
+        self.thread_id:    str           = str(uuid.uuid4())
+        self.session_id:   str           = session_id or str(uuid.uuid4())
+        logger.info(
+            f"VoicePipelineManager: thread_id={self.thread_id[:8]}… "
+            f"session_id={self.session_id[:8]}…"
+        )
 
         self._vad  = VADProcessor()
         self._stt  = SarvamSTTService(api_key=SARVAM_API_KEY)
         self._tts  = SarvamTTSService(api_key=SARVAM_API_KEY)
-        self._llm  = GroqLangGraphProcessor(thread_id=self.thread_id, tts_service=self._tts)
+        self._llm  = GroqLangGraphProcessor(
+            thread_id   = self.thread_id,
+            tts_service = self._tts,
+            session_id  = self.session_id,
+            trace_store = trace_store,
+        )
         self._sink = OutputSink(output_queue=self.output_queue)
 
         self._pipeline = Pipeline([
@@ -1228,6 +1469,19 @@ class VoicePipelineManager:
         )
         logger.info("VoicePipelineManager: pipeline started")
 
+    async def trigger_greeting(self):
+        """
+        Trigger the agent's opening greeting without waiting for the customer
+        to speak first. Bypasses VAD/STT and calls _generate() directly with
+        a sentinel input that the system prompt's OPENING rule handles.
+        """
+        await asyncio.sleep(0.8)   # brief pause so browser is ready to receive audio
+        logger.info("VoicePipelineManager: triggering agent opening greeting")
+        asyncio.create_task(
+            self._llm._generate("__greeting__"),
+            name="agent-greeting",
+        )
+
     async def push_audio(self, pcm_bytes: bytes, sample_rate: int = 48000):
         """Inject a raw PCM audio chunk from the browser into the pipeline."""
         frame = AudioRawFrame(
@@ -1239,17 +1493,22 @@ class VoicePipelineManager:
 
     async def interrupt(self):
         """
-        Feature 1 (Interrupt Fix): Cancel current pipeline processing AND drain
-        the output_queue so no stale TTS audio is sent to the browser afterwards.
+        Barge-in / manual-stop handler. Cancels the CURRENT turn only and drains
+        stale output — WITHOUT tearing down the pipeline, so the agent keeps
+        listening and can respond to the next utterance on the same connection.
 
-        Also cancels any in-flight TTS background tasks so they don't push
-        audio frames after the interrupt (barge-in / manual stop).
+        WHY NOT self._task.cancel(): PipelineTask.cancel() permanently finishes
+        the task/runner (run() short-circuits on has_finished() and can never be
+        re-entered), and nothing recreates it — start() is called exactly once.
+        Using it here made the agent go deaf+mute after the FIRST barge-in for the
+        rest of the call. Turn-level cancel_turn() is the correct scope: it cancels
+        in-flight TTS HTTP tasks, resolves pending futures, and stops the delivery
+        loop, leaving _task/_runner alive. (The pipeline runs with
+        allow_interruptions=False, so Pipecat's own interruption path is off and
+        this manual per-turn cancel is the intended mechanism.)
         """
-        # Cancel in-flight TTS tasks and stop the delivery loop first,
-        # so no new frames are pushed to the queue after we drain it.
+        # Cancel the in-flight turn (TTS tasks + delivery loop) — non-destructive.
         await self._tts.cancel_turn()
-
-        await self._task.cancel()
 
         # Drain all pending output frames so stale audio/status isn't sent
         drained = 0
@@ -1260,7 +1519,7 @@ class VoicePipelineManager:
             except asyncio.QueueEmpty:
                 break
 
-        logger.info(f"VoicePipelineManager: interrupted (drained {drained} stale frames)")
+        logger.info(f"VoicePipelineManager: interrupted current turn (drained {drained} stale frames)")
 
     async def stop(self):
         """Gracefully shut down the pipeline when the WebSocket disconnects."""
@@ -1270,6 +1529,9 @@ class VoicePipelineManager:
                 await asyncio.wait_for(self._runner_coro, timeout=3.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
+        # Free this connection's checkpointer state so the in-RAM MemorySaver
+        # doesn't grow unbounded across connections (Bug #7).
+        await self._llm.cleanup_threads()
         logger.info("VoicePipelineManager: pipeline stopped")
 
     def clear_memory(self):

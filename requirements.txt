@@ -38,3 +38,18 @@ langdetect>=1.0.9          # Feature 7: language detection fallback
 torch>=2.0.0         # PyTorch runtime (CPU-only is fine, no GPU needed)
 torchaudio>=2.0.0    # required by silero-vad for audio utilities
 silero-vad>=5.1.2    # Silero VAD model loader (wraps torch.hub)
+
+# ── Phase 1: Qdrant Cloud vector database ────────────────────────────────────
+qdrant-client>=1.9.0          # async Qdrant client (AsyncQdrantClient)
+
+# ── Phase 2: Embeddings (local, CPU, free) ───────────────────────────────────
+sentence-transformers>=3.0.0  # multilingual-e5-small → 384-dim multilingual embeddings
+pypdf>=4.0.0                  # PDF text extraction (legacy loader, kept for compat)
+pdfplumber>=0.11.0            # layout-aware PDF parsing for smart ingestor
+
+# ── Phase 4: LangSmith observability ─────────────────────────────────────────
+langsmith>=0.1.0              # tracing + eval client
+
+# ── Phase 5: Dream Cycle analysis ────────────────────────────────────────────
+numpy>=1.26.0                 # array ops for clustering
+scikit-learn>=1.4.0           # KMeans clustering for PromptImprovementCycle

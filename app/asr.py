@@ -15,7 +15,10 @@ async def transcribe_audio(file_path: str) -> str:
             }
             data = {
                 "model": "saarika:v2.5",
-                "language_code": "en-IN",
+                # "unknown" → Sarvam auto-detects the language, matching the
+                # production /ws pipeline. Hardcoding "en-IN" forced English
+                # decoding and garbled Hindi/Marathi callers (Bug #19).
+                "language_code": "unknown",
             }
 
             response = await client.post(

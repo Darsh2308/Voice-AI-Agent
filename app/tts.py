@@ -1,10 +1,16 @@
 import httpx
 import base64
+import os
+import tempfile
 from app.config import SARVAM_API_KEY
 
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 
-async def text_to_speech(text: str, output_file: str = "output.wav") -> str:
+# Default output to the system temp dir — the only guaranteed-writable location
+# on Hugging Face Spaces / read-only container filesystems (was CWD "output.wav").
+_DEFAULT_TTS_OUTPUT = os.path.join(tempfile.gettempdir(), "output.wav")
+
+async def text_to_speech(text: str, output_file: str = _DEFAULT_TTS_OUTPUT) -> str:
     headers = {
         "api-subscription-key": SARVAM_API_KEY,
         "Content-Type": "application/json"

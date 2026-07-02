@@ -19,11 +19,14 @@ RUN pip install --no-cache-dir -r requirements.txt \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY app/ ./app/
+COPY data/ ./data/
 
 # Pre-download Silero VAD model into the torch hub cache so no network
-# access is needed at runtime (avoids NO_SOCKET errors on Railway)
+# access is needed at runtime (avoids NO_SOCKET errors on Railway / HF Spaces)
 RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False, verbose=False, trust_repo=True)"
 
-EXPOSE 8000
+# Hugging Face Spaces routes traffic to port 7860 and injects $PORT.
+# Binding to $PORT keeps this portable across HF Spaces / Railway / local.
+EXPOSE 7860
 
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860}
