@@ -41,14 +41,14 @@ import json
 import re
 from typing import Annotated, AsyncGenerator, List
 
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from loguru import logger
 from typing_extensions import TypedDict
 
-from app.config import GROQ_API_KEY, VOICE_LLM_MODEL
+from app.config import GEMINI_API_KEY, GEMINI_BASE_URL, VOICE_LLM_MODEL
 from app.memory import checkpointer
 
 # Phase 2: RAG retrieval pipeline (imported lazily to avoid circular imports
@@ -74,32 +74,66 @@ def set_qdrant_store(store) -> None:
     logger.info("QdrantStore wired into langgraph_flow ✓")
 
 
-async def _load_prompt_addenda() -> list[str]:
+async def _load_prompt_addenda(query_text: str | None = None) -> list[str]:
     """
-    Phase 6: Load approved system-prompt improvements from the Dream Engine.
+    Phase 6: Load approved system-prompt improvements from the Dream Engine,
+    performing a hybrid KAG + RAG lookup based on the query topic and similarity.
 
     Returns a list of addendum strings from improvement_log where
-    category="prompt" and approved=True.  Called once per stream_agent() call
-    so any improvement approved during a dream cycle is automatically picked up
-    in the very next conversation — no restart required.
-
-    Returns an empty list if the store isn't wired in or if the query fails.
+    category="prompt", approved=True, matching the detected topic, sorted by similarity.
     """
     if _qdrant_store is None:
         return []
     try:
         from app.store import IMPROVEMENT_LOG
-        records, _ = await _qdrant_store.scroll(
-            IMPROVEMENT_LOG,
-            filter=_qdrant_store.filter_eq("category", "prompt"),
-            limit=20,
-        )
-        addenda = [
-            r["payload"]["improvement_desc"]
-            for r in records
-            if r["payload"].get("approved") is True
-            and r["payload"].get("improvement_desc")
+        from app.knowledge.embedder import embed_text
+        from app.knowledge.retriever import _detect_topic
+
+        # 1. KAG Pre-Filter Setup (Topic classification)
+        topics = _detect_topic(query_text) if query_text else None
+        conditions = [
+            _qdrant_store.filter_eq("category", "prompt"),
+            _qdrant_store.filter_eq("approved", True),
         ]
+        
+        if topics:
+            # Query rules tagged with the matched topics or general rules
+            topic_list = list(topics)
+            if "general" not in topic_list:
+                topic_list.append("general")
+            conditions.append(_qdrant_store.filter_in("topic", topic_list))
+            
+        filt = _qdrant_store.filter_and(*conditions)
+
+        # 2. RAG Semantic Ranking
+        if query_text:
+            # embed_text hits cache instantly since the main RAG step also calls it
+            query_vector = await embed_text(query_text, prefix="query")
+            records = await _qdrant_store.search(
+                collection=IMPROVEMENT_LOG,
+                vector=query_vector,
+                filter=filt,
+                limit=3,
+            )
+            # Filter by a similarity score threshold (0.70) to ensure relevance
+            addenda = [
+                r["payload"]["improvement_desc"]
+                for r in records
+                if r["payload"].get("improvement_desc") and r.get("score", 0.0) >= 0.70
+            ]
+        else:
+            # Fallback scroll if no user query is available yet (e.g. initialization)
+            records, _ = await _qdrant_store.scroll(
+                IMPROVEMENT_LOG,
+                filter=filt,
+                limit=3,
+            )
+            addenda = [
+                r["payload"]["improvement_desc"]
+                for r in records
+                if r["payload"].get("improvement_desc")
+            ]
+            
         return addenda
     except Exception as exc:
         logger.warning(f"_load_prompt_addenda: failed (non-fatal): {exc}")
@@ -119,10 +153,27 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Groq async client (shared across calls)
+# Voice LLM client (shared across calls)
 # ─────────────────────────────────────────────────────────────────────────────
+# Gemini Flash-Lite via its OpenAI-compatible endpoint. The OpenAI SDK returns
+# the same streaming/tool-call object shape the parsing below expects, so this
+# is a drop-in for the previous Groq client. Kept on a separate provider from
+# the Dream Engine (Groq) so their free-tier pools are independent.
+_voice_llm = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
 
-_groq = AsyncGroq(api_key=GROQ_API_KEY)
+
+def _voice_reasoning_kwargs() -> dict:
+    """Extra kwargs for the voice LLM call.
+
+    `reasoning_effort` is a gpt-oss (Groq) reasoning-model param. Gemini's
+    OpenAI-compatible endpoint rejects unknown params, so include it ONLY when
+    the configured voice model is a gpt-oss model — this keeps an env-only
+    rollback to Groq working without touching code.
+    """
+    m = VOICE_LLM_MODEL.lower()
+    if "gpt-oss" in m or m.startswith("openai/"):
+        return {"reasoning_effort": "low"}
+    return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +319,25 @@ LANG_NAMES: dict[str, str] = {
     "or-IN": "Odia",
 }
 
+# BCP-47 → native script name. Injected into the LANGUAGE RULE so the reply
+# script is pinned deterministically for EVERY language, not just the inline
+# examples — mirrors the harness's per-language script map. Sarvam's bulbul TTS
+# pronounces native script authentically, so wrong/romanized script is the main
+# cause of bad pronunciation.
+LANG_SCRIPTS: dict[str, str] = {
+    "en-IN": "Latin",
+    "hi-IN": "Devanagari",
+    "mr-IN": "Devanagari",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "bn-IN": "Bengali",
+    "gu-IN": "Gujarati",
+    "pa-IN": "Gurmukhi",
+    "ml-IN": "Malayalam",
+    "or-IN": "Odia",
+}
+
 
 # Localized "sorry, please repeat" lines. Spoken when a turn produces no visible
 # content (e.g. a reasoning model spent its whole budget on hidden reasoning) so
@@ -290,6 +360,24 @@ _FALLBACK_PHRASES: dict[str, str] = {
 def _fallback_phrase(language: str) -> str:
     """Localized 'sorry, please repeat' line, defaulting to English."""
     return _FALLBACK_PHRASES.get(language, _FALLBACK_PHRASES["en-IN"])
+
+
+# Localized "we're at capacity, try again shortly" lines. Spoken when the voice
+# LLM's free tier / rate limit is exhausted (a 429 that survives the bounded
+# retry). This is a DISTINCT situation from "didn't catch that": the caller did
+# nothing wrong, the service is momentarily unavailable — so we say so honestly
+# instead of implying a transcription problem. Core demo languages only; any
+# other detected language falls back to English (see _busy_phrase).
+_BUSY_PHRASES: dict[str, str] = {
+    "en-IN": "Sorry, we're experiencing very high demand right now. Please try calling again in a little while.",
+    "hi-IN": "माफ़ कीजिए, अभी हमारे पास बहुत ज़्यादा कॉल्स आ रही हैं। कृपया थोड़ी देर बाद दोबारा कॉल करें।",
+    "mr-IN": "माफ करा, सध्या आमच्याकडे खूप गर्दी आहे. कृपया थोड्या वेळाने पुन्हा कॉल करा.",
+}
+
+
+def _busy_phrase(language: str) -> str:
+    """Localized 'service at capacity / limit reached' line, defaulting to English."""
+    return _BUSY_PHRASES.get(language, _BUSY_PHRASES["en-IN"])
 
 
 async def _empty_aiter():
@@ -584,7 +672,7 @@ async def _summarize_history(config: dict):
     )
 
     logger.info(f"Summarizing {len(old_msgs)} old messages…")
-    resp = await _groq.chat.completions.create(
+    resp = await _voice_llm.chat.completions.create(
         model=VOICE_LLM_MODEL,
         messages=[{
             "role": "user",
@@ -593,7 +681,7 @@ async def _summarize_history(config: dict):
                 f"topics, decisions, and context:\n\n{history_text}"
             )
         }],
-        reasoning_effort="low",   # GPT-OSS reasoning model — minimise overhead
+        **_voice_reasoning_kwargs(),
         max_tokens=300,
         temperature=0.3,
     )
@@ -676,10 +764,10 @@ async def llm_node(state: AgentState) -> dict:
 
     logger.debug(f"llm_node: {len(api_messages)} messages in context")
 
-    resp = await _groq.chat.completions.create(
+    resp = await _voice_llm.chat.completions.create(
         model=VOICE_LLM_MODEL,
         messages=api_messages,
-        reasoning_effort="low",   # GPT-OSS reasoning model — minimise overhead
+        **_voice_reasoning_kwargs(),
         temperature=0.7,
         max_tokens=200,
     )
@@ -862,15 +950,22 @@ async def stream_agent(
     # Effective reply language: an active lock wins over per-turn detection.
     effective_language = locked_language or language
 
+    # ── Phase 2+4+6: Parallel RAG Context + KAG/RAG Prompt Addenda retrieval ────
+    # Start both tasks in background to run concurrently.
+    _rag_task = None
+    if _retrieval_pipeline is not None and _should_retrieve(user_text):
+        _rag_task = asyncio.create_task(_retrieve_context(user_text, effective_language))
+    else:
+        logger.debug(f"stream_agent: RAG skipped (no knowledge keywords in {user_text[:40]!r})")
+
+    _addenda_task = asyncio.create_task(_load_prompt_addenda(user_text))
+
     # ── 2. Build system prompt ────────────────────────────────────────────────
     system = BASE_SYSTEM_PROMPT + EMOTION_ADDENDA.get(emotion_hint, "")
 
-    # Phase 6: append Dream Engine approved improvements (non-fatal if unavailable)
-    # Cap at 3 addenda — every one is added to EVERY prompt on EVERY turn, so an
-    # unbounded list silently bloats the token count and contributed to the 413
-    # "request too large" error. 3 most-relevant improvements is plenty.
+    # Await the prompt addenda rules (usually very fast as it hits cache)
     try:
-        addenda = (await _load_prompt_addenda())[:3]
+        addenda = await asyncio.wait_for(_addenda_task, timeout=1.0)
         for addendum in addenda:
             system += f"\n{addendum}"
         if addenda:
@@ -882,11 +977,16 @@ async def stream_agent(
     # effective_language = an explicit lock (if the user asked to switch) else
     # the STT-detected language. Reply ONLY in it — no mixing, no switching.
     lang_name = LANG_NAMES.get(effective_language, effective_language)
+    # Pin the exact script per language (harness-style). Falls back to a generic
+    # "native script of {lang}" instruction if the code isn't in the map.
+    script_name = LANG_SCRIPTS.get(effective_language)
+    script_clause = (
+        f" using the {script_name} script only"
+        if script_name else f" using the native script of {lang_name} only"
+    )
     system += (
-        f"\n\nLANGUAGE RULE (mandatory): Reply ENTIRELY in {lang_name}."
-        f" Do NOT mix in any other language."
-        f" Use the native script of {lang_name}"
-        f" (e.g. Devanagari for Hindi/Marathi, Tamil script for Tamil, etc.)."
+        f"\n\nLANGUAGE RULE (mandatory): Reply ENTIRELY in {lang_name}{script_clause}."
+        f" Do NOT transliterate, romanize, or mix in any other language or script."
         f" Even if the user's input was in Roman/Latin script,"
         f" your reply must be in proper {lang_name} native script."
         f" Violating this rule is not allowed under any circumstances."
@@ -912,14 +1012,7 @@ async def stream_agent(
 
     retrieved_docs: list[dict] = []
 
-    # Start RAG in background (non-blocking) — ONLY if the query actually needs
-    # knowledge-base facts. Chitchat / confirmations skip RAG entirely, which
-    # keeps the prompt small and avoids blowing the per-minute token limit.
-    _rag_task = None
-    if _retrieval_pipeline is not None and _should_retrieve(user_text):
-        _rag_task = asyncio.create_task(_retrieve_context(user_text, effective_language))
-    else:
-        logger.debug(f"stream_agent: RAG skipped (no knowledge keywords in {user_text[:40]!r})")
+    # _rag_task was already started in parallel at Phase 2+4+6 above.
 
     # Build base api_messages WITHOUT RAG context yet
     api_messages = [{"role": "system", "content": system}]
@@ -983,21 +1076,25 @@ async def stream_agent(
         # tools list can error on some API versions, and omitting them avoids any
         # accidental tool-calling overhead.
         tool_kwargs = {"tools": TOOLS, "tool_choice": "auto"} if TOOLS else {}
-        return await _groq.chat.completions.create(
+        return await _voice_llm.chat.completions.create(
             model=VOICE_LLM_MODEL,
             messages=messages,
             **tool_kwargs,
-            # GPT-OSS is a reasoning model: it spends tokens on hidden
-            # chain-of-thought before the visible answer. "low" minimises that
-            # overhead so short voice replies aren't eaten by reasoning, and
-            # max_tokens is raised to 200 to leave room for the actual answer.
-            reasoning_effort="low",
+            # _voice_reasoning_kwargs() adds reasoning_effort="low" only for
+            # gpt-oss models; Gemini (the default voice model) needs no reasoning
+            # tax — it emits visible tokens immediately, which is why first-token
+            # latency is low. max_tokens=200 leaves ample room for a short reply.
+            **_voice_reasoning_kwargs(),
             max_tokens=200,
             temperature=0.5,
             stream=True,
         )
 
     stream = None
+    # Set when the voice LLM's rate limit / free-tier quota is exhausted and the
+    # bounded retry still fails. Drives a distinct "we're at capacity" message
+    # (vs the generic "didn't catch that") in the empty-reply guard below.
+    quota_exhausted = False
     try:
         stream = await _open_stream(api_messages)
     except Exception as _llm_exc:
@@ -1015,18 +1112,24 @@ async def stream_agent(
             except Exception as _retry_exc:
                 logger.error(f"stream_agent: 413 retry also failed: {_retry_exc}")
                 stream = None
-        elif "429" in _msg or "rate" in _msg or "too many" in _msg:
-            # Shared Groq budget hit its per-minute cap. Retry ONCE after a short
-            # bounded sleep (the SDK already retried transient blips, so this is a
-            # brief real contention). If it still fails, fall through to the
-            # empty-reply fallback below rather than raising into dead air. (Bug #13)
-            logger.warning("stream_agent: 429 rate limit — one bounded retry after 1.5s")
+        elif any(k in _msg for k in ("429", "rate", "too many", "quota", "resource_exhausted", "exhausted")):
+            # Voice LLM hit a rate/quota limit. Retry ONCE after a short bounded
+            # sleep (the SDK already retried transient blips, so this is brief
+            # real contention — e.g. a per-minute burst). If it STILL fails, the
+            # free-tier quota is likely exhausted: flag it so the guard below
+            # speaks a graceful "we're at capacity" message instead of dead air
+            # or a misleading "didn't catch that". (Bug #13)
+            logger.warning("stream_agent: rate/quota limit — one bounded retry after 1.5s")
             await asyncio.sleep(1.5)
             try:
                 stream = await _open_stream(api_messages)
             except Exception as _retry_exc:
-                logger.error(f"stream_agent: 429 retry failed: {_retry_exc}")
+                logger.error(
+                    f"stream_agent: rate/quota retry failed — voice LLM free tier "
+                    f"likely exhausted: {_retry_exc}"
+                )
                 stream = None
+                quota_exhausted = True
         else:
             raise
 
@@ -1135,10 +1238,10 @@ async def stream_agent(
 
         follow_up_messages = api_messages + [assistant_tool_msg] + tool_results
 
-        stream2 = await _groq.chat.completions.create(
+        stream2 = await _voice_llm.chat.completions.create(
             model=VOICE_LLM_MODEL,
             messages=follow_up_messages,
-            reasoning_effort="low",   # GPT-OSS reasoning model — minimise overhead
+            **_voice_reasoning_kwargs(),
             max_tokens=250,
             temperature=0.7,
             stream=True,
@@ -1173,13 +1276,22 @@ async def stream_agent(
     # context. Speak a localized "sorry, please repeat" instead, and make sure the
     # turn is persisted (full_response is now non-empty, so §6 saves it).
     if not _strip_end_call(full_response).strip():
-        fallback = _fallback_phrase(effective_language)
-        logger.warning(
-            "stream_agent: empty model reply (likely reasoning starvation) — "
-            f"emitting fallback in {effective_language}"
-        )
-        full_response = fallback
-        yield fallback
+        if quota_exhausted:
+            # Free tier / rate limit hit and the retry failed — the service is
+            # momentarily unavailable, not a transcription miss. Say so honestly.
+            phrase = _busy_phrase(effective_language)
+            logger.warning(
+                "stream_agent: voice LLM free tier/quota exhausted — "
+                f"emitting 'at capacity' message in {effective_language}"
+            )
+        else:
+            phrase = _fallback_phrase(effective_language)
+            logger.warning(
+                "stream_agent: empty model reply (likely reasoning starvation) — "
+                f"emitting fallback in {effective_language}"
+            )
+        full_response = phrase
+        yield phrase
 
     # ── 5. Expose metadata for trace recording (Phase 3) ─────────────────────
     # Agent-initiated hangup: if the model appended [END_CALL] anywhere in its

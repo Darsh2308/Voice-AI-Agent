@@ -34,7 +34,6 @@ import asyncio
 import json
 import os
 import sys
-import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -42,12 +41,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
-import shutil
 
 logger.remove()
 logger.add(sys.stdout, level="DEBUG")
 
-from app.pipeline import run_pipeline
 from app.pipecat_pipeline import (
     VoicePipelineManager,
     AIAudioFrame,
@@ -263,18 +260,6 @@ async def root():
             status_code=404,
         )
     return FileResponse(index_path, media_type="text/html")
-
-
-@app.post("/voice")
-async def voice_agent(file: UploadFile = File(...)):
-    """One-shot voice endpoint — unchanged."""
-    # Write uploads to the system temp dir (the only guaranteed-writable location
-    # on Hugging Face Spaces / read-only container filesystems), not CWD.
-    file_path = os.path.join(tempfile.gettempdir(), f"temp_{file.filename}")
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    output_audio = await run_pipeline(file_path)
-    return {"message": "Processed successfully", "output_audio": output_audio}
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────

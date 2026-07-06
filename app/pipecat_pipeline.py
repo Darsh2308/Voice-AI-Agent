@@ -65,6 +65,7 @@ import array
 import asyncio
 import base64
 import io
+import json
 import os
 import re
 import tempfile
@@ -74,8 +75,10 @@ import uuid
 import wave
 from datetime import datetime, timezone
 from typing import List, Optional
+from urllib.parse import urlencode
 
 import httpx
+import websockets
 from loguru import logger
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +96,14 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 
-from app.config import SARVAM_API_KEY
+from app.config import (
+    SARVAM_API_KEY,
+    TTS_STREAMING,
+    SARVAM_STT_MODEL,
+    SARVAM_STT_MODE,
+    SARVAM_TTS_MODEL,
+    SARVAM_TTS_SPEAKER,
+)
 from app.num_to_words import spell_digits as _spell_digits
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,24 +608,31 @@ class SarvamSTTService(FrameProcessor):
         Feature 10: If Sarvam returns a confidence score < 0.6, we emit
         an EmotionHintFrame("hesitant") so the LLM can be more encouraging.
         """
+        stt_t0 = time.monotonic()   # LATENCY: measure the ASR round-trip
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="pipecat_utt_")
         try:
             with os.fdopen(tmp_fd, "wb") as f:
                 f.write(frame.audio_bytes)
 
+            # Model/mode come from config (.env) so Sarvam STT versions can be
+            # migrated without code changes. `mode` is only valid on saaras:*
+            # models (saarika ignores/rejects it), so add it conditionally.
+            stt_data = {
+                "model": SARVAM_STT_MODEL,
+                # Always "unknown" — let Sarvam auto-detect every turn.
+                # This is the only way to correctly handle mid-conversation
+                # language switches (English → Hindi → English → Marathi…).
+                "language_code": "unknown",
+                "with_disfluencies": "false",
+            }
+            if SARVAM_STT_MODEL.startswith("saaras"):
+                stt_data["mode"] = SARVAM_STT_MODE
             with open(tmp_path, "rb") as f:
                 resp = await self._http.post(
                     self.SARVAM_ASR_URL,
                     headers={"api-subscription-key": self._api_key},
                     files={"file": ("audio.wav", f, "audio/wav")},
-                    data={
-                        "model": "saarika:v2.5",
-                        # Always "unknown" — let Sarvam auto-detect every turn.
-                        # This is the only way to correctly handle mid-conversation
-                        # language switches (English → Hindi → English → Marathi…).
-                        "language_code": "unknown",
-                        "with_disfluencies": "false",
-                    },
+                    data=stt_data,
                 )
 
             if resp.status_code != 200:
@@ -624,7 +641,9 @@ class SarvamSTTService(FrameProcessor):
 
             resp_json   = resp.json()
             transcript  = resp_json.get("transcript", "").strip()
+            stt_ms = int((time.monotonic() - stt_t0) * 1000)
             logger.info(f"STT transcript: {transcript!r}")
+            logger.info(f"LATENCY stt_ms={stt_ms}")
 
             # ── Feature 7: Language detection ──────────────────────────────
             # Sarvam returns the detected language code in the response.
@@ -812,6 +831,14 @@ class GroqLangGraphProcessor(FrameProcessor):
         first_sentence = True
         meta_out: dict = {}          # Phase 2+3: populated by stream_agent
         start_time     = time.monotonic()
+        llm_first_ms: int | None = None   # LATENCY: turn start → first sentence
+        # Stamp turn start on the TTS service so it can measure the time to the
+        # FIRST audio byte (tts_first_audio_ms) — the number that governs how
+        # responsive the agent feels. Turns are serialized by _generate_lock and
+        # TTS processes one turn at a time, so this single field is race-free.
+        if self._tts is not None:
+            self._tts._turn_t0             = start_time
+            self._tts._first_audio_recorded = False
 
         try:
             async for sentence in stream_agent(
@@ -825,6 +852,8 @@ class GroqLangGraphProcessor(FrameProcessor):
                     continue
 
                 if first_sentence:
+                    llm_first_ms = int((time.monotonic() - start_time) * 1000)
+                    logger.info(f"LATENCY llm_first_sentence_ms={llm_first_ms}")
                     await self.push_frame(AIThinkingFrame(thinking=False))
                     first_sentence = False
 
@@ -856,6 +885,7 @@ class GroqLangGraphProcessor(FrameProcessor):
                         tool_calls        = meta_out.get("tool_calls",     []),
                         ai_response       = full_text.strip(),
                         latency_ms        = latency_ms,
+                        llm_first_ms      = llm_first_ms,
                         emotion_hint      = self._emotion_hint,
                         created_at        = datetime.now(timezone.utc).isoformat(),
                     )
@@ -972,6 +1002,24 @@ _TTS_PRONUNCIATION_MAP = [
 #            AIStatusFrame(False)   (after last sentence audio)
 #
 
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    """Wrap raw 16-bit mono PCM in a WAV header.
+
+    The Sarvam TTS WebSocket returns raw PCM (content_type audio/pcm); the
+    browser client and the batch path both expect self-contained WAV blobs.
+    Wrapping each streamed chunk here keeps the downstream AIAudioFrame contract
+    (and main.py's SARVAM_AUDIO_BYTES_PER_SEC math) byte-identical to today, so
+    nothing downstream — server or browser — needs to change.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
 def _concat_wavs(wav_list: list[bytes]) -> bytes:
     """
     Concatenate multiple WAV byte blobs into a single WAV.
@@ -1043,6 +1091,10 @@ class SarvamTTSService(FrameProcessor):
         self._llm_done: asyncio.Event | None = None
         # Track background tasks so interrupt() can cancel them
         self._inflight_tasks: list = []
+        # LATENCY: turn start (monotonic secs) stamped by the LLM processor at
+        # turn start; the first-audio delta is recorded once per turn.
+        self._turn_t0: float | None = None
+        self._first_audio_recorded  = False
 
     # ── Pipecat frame handler ─────────────────────────────────────────────────
 
@@ -1127,8 +1179,8 @@ class SarvamTTSService(FrameProcessor):
                 json={
                     "inputs":               [tts_text],
                     "target_language_code": language,
-                    "speaker":              "anushka",
-                    "model":                "bulbul:v2",
+                    "speaker":              SARVAM_TTS_SPEAKER,
+                    "model":                SARVAM_TTS_MODEL,
                 },
             )
 
@@ -1226,6 +1278,16 @@ class SarvamTTSService(FrameProcessor):
                 if first:
                     first = False
                     self._tts_active = True
+                    # LATENCY: time from LLM turn start to the FIRST audio byte
+                    # leaving for the browser — the single number that governs how
+                    # responsive the agent feels. Measured HERE because, with the
+                    # pipeline-parallel TTS design, first-audio happens
+                    # asynchronously relative to the LLM turn's own bookkeeping,
+                    # so it cannot be captured in the LLM processor's TurnTrace.
+                    if self._turn_t0 is not None and not self._first_audio_recorded:
+                        self._first_audio_recorded = True
+                        tts_first_audio_ms = int((time.monotonic() - self._turn_t0) * 1000)
+                        logger.info(f"LATENCY tts_first_audio_ms={tts_first_audio_ms}")
                     await self.push_frame(AIStatusFrame(ai_speaking=True))
 
                 await self.push_frame(AIAudioFrame(audio_bytes=wav_bytes))
@@ -1312,6 +1374,10 @@ class SarvamTTSService(FrameProcessor):
         self._llm_done      = None
         self._pending       = []
         self._delivery_task = None
+        # LATENCY: drop this turn's timing so a barged-in turn never leaks its
+        # start into the next turn's tts_first_audio_ms.
+        self._turn_t0              = None
+        self._first_audio_recorded = False
 
     def _normalize_pronunciation(self, text: str) -> str:
         """
@@ -1341,6 +1407,246 @@ class SarvamTTSService(FrameProcessor):
 
     async def cleanup(self):
         await self._http.aclose()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. SarvamTTSStreamingService  (Text-to-Speech over the streaming WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Flag-gated alternative to SarvamTTSService (batch HTTP), enabled by
+# TTS_STREAMING=true. Chosen in VoicePipelineManager; when the flag is off this
+# class is never instantiated and behavior is byte-identical to before.
+#
+# Why it can be a drop-in: the Sarvam TTS WebSocket returns raw 22050 Hz mono
+# PCM. We wrap each streamed chunk in a WAV header (_pcm_to_wav) and emit the
+# SAME AIAudioFrame(WAV) the batch path emits, so OutputSink, main.py's
+# send_loop, and the browser client are all unchanged.
+#
+# Lifecycle is PER-TURN (like the harness): a worker task opens the WS on the
+# first TextFrame, a sender streams sentence text in as it arrives, and a reader
+# loop wraps audio chunks and pushes them downstream until Sarvam's end signal
+# ({"type":"event","data":{"event_type":"final"}}), then closes the socket —
+# which is what avoids the idle "408 left open too long" the spike surfaced.
+#
+# Receives:  TextFrame, LLMTurnDoneFrame, EndCallFrame, LanguageDetectedFrame
+# Emits:     AIStatusFrame(True/False), AIAudioFrame(WAV per chunk), EndCallFrame
+#
+
+class SarvamTTSStreamingService(FrameProcessor):
+    """Streaming Sarvam TTS over a per-turn WebSocket. See section header."""
+
+    SARVAM_TTS_WS   = "wss://api.sarvam.ai/text-to-speech/ws"
+    TTS_CHAR_LIMIT  = 450
+    MODEL           = SARVAM_TTS_MODEL
+    SPEAKER         = SARVAM_TTS_SPEAKER
+    SAMPLE_RATE     = 22050   # matches main.py SARVAM_AUDIO_BYTES_PER_SEC
+
+    def __init__(self, api_key: str, **kwargs):
+        super().__init__(**kwargs)
+        self._api_key      = api_key
+        self._language     = "en-IN"   # Feature 7: updated by LanguageDetectedFrame
+        self._tts_active   = False
+        self._end_call_pending = False
+        # Per-turn worker + its text queue. A turn "accepts text" from its first
+        # TextFrame until LLMTurnDoneFrame flips _turn_flushed; the next TextFrame
+        # then starts a fresh turn (its own queue, worker, and WebSocket).
+        self._text_queue: asyncio.Queue | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._turn_flushed = False
+        # LATENCY: turn start (monotonic secs) stamped by the LLM processor; the
+        # first-audio delta is logged once per turn. Kept for parity with the
+        # batch service so GroqLangGraphProcessor can stamp either impl.
+        self._turn_t0: float | None = None
+        self._first_audio_recorded  = False
+
+    # ── Pipecat frame handler ─────────────────────────────────────────────────
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TextFrame):
+            new_turn = self._text_queue is None or self._turn_flushed
+            if new_turn:
+                self._turn_flushed = False
+                self._text_queue   = asyncio.Queue()
+                # Capture per-turn context now so a later LanguageDetectedFrame
+                # or _turn_t0 change can't alter this turn's worker underneath us.
+                self._worker_task = asyncio.create_task(
+                    self._run_turn(self._text_queue, self._language, self._turn_t0)
+                )
+            await self._text_queue.put(frame.text)
+
+        elif isinstance(frame, LLMTurnDoneFrame):
+            # End of this turn's text. Signal the sender to flush; the reader
+            # drains remaining audio and self-terminates on the 'final' event.
+            self._turn_flushed = True
+            if self._text_queue is not None:
+                await self._text_queue.put(None)
+
+        elif isinstance(frame, EndCallFrame):
+            # Forwarded by the worker only AFTER the goodbye audio is delivered,
+            # so the farewell is heard before main.py closes the socket.
+            logger.info("TTS(stream): EndCallFrame received — hang up after goodbye")
+            self._end_call_pending = True
+
+        elif isinstance(frame, LanguageDetectedFrame):
+            self._language = frame.language_code
+            logger.info(f"TTS(stream): language switched to {frame.language_code!r}")
+            await self.push_frame(frame, direction)
+
+        else:
+            await self.push_frame(frame, direction)
+
+    # ── Per-turn worker: open WS, stream text in, push audio out ──────────────
+
+    async def _run_turn(self, text_queue: asyncio.Queue, language: str, turn_t0):
+        url = f"{self.SARVAM_TTS_WS}?{urlencode({'model': self.MODEL, 'send_completion_event': 'true'})}"
+        ws = None
+        sender = None
+        first_audio  = True
+        emitted_true = False   # did we push AIStatusFrame(True) this turn?
+        try:
+            ws = await websockets.connect(
+                url, additional_headers={"Api-Subscription-Key": self._api_key}
+            )
+            await ws.send(json.dumps({
+                "type": "config",
+                "data": {
+                    "model":                self.MODEL,
+                    "target_language_code": language,
+                    "speaker":              self.SPEAKER,
+                    "output_audio_codec":   "linear16",
+                    "speech_sample_rate":   self.SAMPLE_RATE,
+                },
+            }))
+            sender = asyncio.create_task(self._sender(ws, text_queue, language))
+
+            async for raw in ws:
+                ev    = json.loads(raw)
+                etype = ev.get("type")
+                if etype == "audio":
+                    b64 = (ev.get("data") or {}).get("audio", "")
+                    if not b64:
+                        continue
+                    wav = _pcm_to_wav(base64.b64decode(b64), self.SAMPLE_RATE)
+                    if first_audio:
+                        first_audio  = False
+                        emitted_true = True
+                        self._tts_active = True
+                        if turn_t0 is not None:
+                            ms = int((time.monotonic() - turn_t0) * 1000)
+                            logger.info(f"LATENCY tts_first_audio_ms={ms}")
+                        await self.push_frame(AIStatusFrame(ai_speaking=True))
+                    await self.push_frame(AIAudioFrame(audio_bytes=wav))
+                elif etype == "event" and (ev.get("data") or {}).get("event_type") == "final":
+                    break
+                elif etype in {"complete", "completed"}:
+                    break
+                elif etype == "error":
+                    logger.error(f"TTS(stream): error event {json.dumps(ev)[:300]}")
+                    break
+
+            if sender is not None:
+                sender.cancel()
+
+        except asyncio.CancelledError:
+            # Barge-in / interrupt. Re-raise after finally cleans up the socket.
+            logger.warning("TTS(stream): turn cancelled")
+            raise
+        except Exception as exc:
+            logger.error(f"TTS(stream): turn error: {exc}")
+        finally:
+            if sender is not None and not sender.done():
+                sender.cancel()
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            # Mirror the batch path: emit AIStatusFrame(False) if we ever signalled
+            # speaking, so the client always leaves the "speaking" state. Guarded
+            # because on cancel the push may itself be interrupted.
+            if emitted_true:
+                try:
+                    await self.push_frame(AIStatusFrame(ai_speaking=False))
+                except Exception:
+                    pass
+            self._tts_active = False
+            if self._end_call_pending:
+                self._end_call_pending = False
+                logger.info("TTS(stream): goodbye delivered — forwarding EndCallFrame")
+                try:
+                    await self.push_frame(EndCallFrame())
+                except Exception:
+                    pass
+
+    async def _sender(self, ws, text_queue: asyncio.Queue, language: str):
+        """Drain the text queue into the WS; a None item means flush + stop."""
+        try:
+            while True:
+                text = await text_queue.get()
+                if text is None:
+                    await ws.send(json.dumps({"type": "flush"}))
+                    return
+                # Same pre-TTS processing as the batch path: spell digits in the
+                # reply language, apply the pronunciation map, then truncate.
+                spoken   = _spell_digits(text, language)
+                tts_text = self._truncate(self._normalize_pronunciation(spoken))
+                if tts_text.strip():
+                    await ws.send(json.dumps({"type": "text", "data": {"text": tts_text}}))
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(f"TTS(stream): sender error: {exc}")
+
+    # ── Turn control (parity with SarvamTTSService) ───────────────────────────
+
+    async def flush(self):
+        """Wait for the current turn's worker to finish draining audio."""
+        if self._worker_task and not self._worker_task.done():
+            try:
+                await asyncio.wait_for(self._worker_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error("TTS(stream): flush timed out")
+                self._worker_task.cancel()
+            except Exception as exc:
+                logger.error(f"TTS(stream): flush error: {exc}")
+
+    async def cancel_turn(self):
+        """Barge-in / interrupt: kill the worker and its WebSocket immediately."""
+        task = self._worker_task
+        # Reset to a pristine 'no turn in progress' state so the NEXT TextFrame
+        # is treated as a fresh turn.
+        self._worker_task = None
+        self._text_queue  = None
+        self._turn_flushed = False
+        self._turn_t0     = None
+        self._first_audio_recorded = False
+        self._tts_active  = False
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _normalize_pronunciation(self, text: str) -> str:
+        for pattern, replacement in _TTS_PRONUNCIATION_MAP:
+            text = pattern.sub(replacement, text)
+        return text
+
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.TTS_CHAR_LIMIT:
+            return text
+        truncated = text[:self.TTS_CHAR_LIMIT]
+        for punct in (".", "?", "!"):
+            last = truncated.rfind(punct)
+            if last > self.TTS_CHAR_LIMIT // 2:
+                return truncated[:last + 1]
+        return truncated
+
+    async def cleanup(self):
+        await self.cancel_turn()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1423,7 +1729,13 @@ class VoicePipelineManager:
 
         self._vad  = VADProcessor()
         self._stt  = SarvamSTTService(api_key=SARVAM_API_KEY)
-        self._tts  = SarvamTTSService(api_key=SARVAM_API_KEY)
+        # TTS transport is flag-selectable. Default (flag off) = batch HTTP,
+        # byte-identical to before. TTS_STREAMING=true = streaming WebSocket.
+        if TTS_STREAMING:
+            self._tts = SarvamTTSStreamingService(api_key=SARVAM_API_KEY)
+            logger.info("TTS: streaming WebSocket mode ENABLED (TTS_STREAMING=true)")
+        else:
+            self._tts = SarvamTTSService(api_key=SARVAM_API_KEY)
         self._llm  = GroqLangGraphProcessor(
             thread_id   = self.thread_id,
             tts_service = self._tts,

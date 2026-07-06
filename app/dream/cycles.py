@@ -617,6 +617,7 @@ Return ONLY valid JSON (no markdown):
 {
   "addendum": "<the exact instruction text to add to the system prompt>",
   "applies_to": "<brief description of what failure pattern this fixes>",
+  "topic": "billing|network|policy|competitive|general",
   "confidence": <float 0.0-1.0>
 }"""
 
@@ -754,6 +755,7 @@ class PromptImprovementCycle(_BaseCycle):
                         "confidence":  confidence,
                         "judge_score": avg_judge,
                         "approved":    True,
+                        "topic":       proposal.get("topic", "general"),
                     },
                 )
                 improvements_applied += 1
@@ -978,6 +980,7 @@ class MemoryConsolidationCycle(_BaseCycle):
             ("stale_profiles",   self._cleanup_stale_profiles),
             ("summary_refresh",  self._refresh_customer_summaries),
             ("kb_hygiene",       self._flag_unused_kb_docs),
+            ("cleanup_traces",   self._cleanup_old_traces),
         ]
 
         for step_name, step_fn in steps:
@@ -1151,6 +1154,55 @@ class MemoryConsolidationCycle(_BaseCycle):
         logger.info(
             f"MemoryConsolidationCycle: flagged {flagged} never-retrieved KB documents"
         )
+
+    async def _cleanup_old_traces(self) -> None:
+        """
+        Delete synthetic traces and fully processed real traces that are older than 30 days
+        to free up space in our free-tier Qdrant database.
+        """
+        from datetime import timedelta
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self.SYNTHETIC_CLEANUP_DAYS)
+        ).isoformat()
+
+        # Fetch traces from EXECUTION_TRACES (limit 500 per run to avoid memory spikes)
+        try:
+            records, _ = await self._store.scroll(
+                EXECUTION_TRACES,
+                limit=500
+            )
+        except Exception as exc:
+            logger.warning(f"MemoryConsolidationCycle: scroll for cleanup failed: {exc}")
+            return
+
+        ids_to_delete = []
+        for r in records:
+            payload = r["payload"]
+            created_at = payload.get("created_at", "")
+            if not created_at or created_at >= cutoff:
+                continue
+
+            # Case 1: Synthetic trace older than 30 days
+            is_synthetic = payload.get("customer_id") == "synthetic"
+
+            # Case 2: Real trace fully processed and older than 30 days
+            is_processed_real = payload.get("dream_processed") is True
+
+            if is_synthetic or is_processed_real:
+                ids_to_delete.append(str(r["id"]))
+
+        if ids_to_delete:
+            try:
+                await self._store.delete_points(EXECUTION_TRACES, ids_to_delete)
+                logger.info(
+                    f"MemoryConsolidationCycle: deleted {len(ids_to_delete)} old/synthetic traces "
+                    f"older than {self.SYNTHETIC_CLEANUP_DAYS} days"
+                )
+            except Exception as exc:
+                logger.warning(f"MemoryConsolidationCycle: failed to delete old traces: {exc}")
+        else:
+            logger.info("MemoryConsolidationCycle: no old/synthetic traces need deletion")
 
 
 # ---------------------------------------------------------------------------

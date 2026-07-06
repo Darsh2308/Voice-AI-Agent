@@ -57,6 +57,7 @@ class TurnTrace:
     latency_ms:        int
     emotion_hint:      str                 # "neutral" | "hesitant" | "agitated"
     created_at:        str                 # ISO-8601 UTC
+    llm_first_ms:      Optional[int]   = None  # turn start → first sentence (ms)
     eval_score:        Optional[float] = None   # filled by Dream Cycle
     customer_feedback: Optional[str]  = None   # filled if customer rates the turn
     dream_processed:   bool           = False  # True after Dream Cycle has analyzed it
@@ -404,6 +405,7 @@ def _record_to_turn(payload: dict) -> TurnTrace:
         latency_ms        = int(payload.get("latency_ms",    0)),
         emotion_hint      = payload.get("emotion_hint",      "neutral"),
         created_at        = payload.get("created_at",        ""),
+        llm_first_ms      = payload.get("llm_first_ms"),
         eval_score        = payload.get("eval_score"),
         customer_feedback = payload.get("customer_feedback"),
         dream_processed   = bool(payload.get("dream_processed", False)),
