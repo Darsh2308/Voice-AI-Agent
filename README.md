@@ -34,7 +34,7 @@ into the live agent — with no restart and no human in the loop.
 3. [Models Used — TTS, STT, LLM, Embeddings, RAG](#3-models-used)
 4. [The RAG Knowledge System](#4-the-rag-knowledge-system)
 5. [The Dream Engine — How Self-Improvement Works](#5-the-dream-engine)
-6. [The Self-Improvement Feedback Loop (end to end)](#6-the-self-improvement-feedback-loop)
+6. [The Self-Improvement Feedback Loop — Hybrid KAG + RAG](#6-the-self-improvement-feedback-loop--hybrid-kag--rag)
 7. [Every Edge Case We Handle](#7-every-edge-case-we-handle)
 8. [Architecture Map & Data Stores](#8-architecture-map--data-stores)
 9. [Configuration Reference](#9-configuration-reference)
@@ -77,7 +77,7 @@ of data (an audio chunk, a transcript, a sentence, synthesized audio) is a typed
 pushes new frames downstream. This makes every component independently replaceable.
 
 ```
-BROWSER (index.html)
+BROWSER (https://voice-ai.darshpatil.site)
   │  16-bit PCM mic audio  ─┐        ┌─  WAV audio + transcripts + status JSON
   ▼                        │  WebSocket /ws (full-duplex)         ▲
 FastAPI server (app/main.py)  ── echo cooldown · barge-in · timeout · hangup ──┘
@@ -102,7 +102,7 @@ FastAPI server (app/main.py)  ── echo cooldown · barge-in · timeout · han
 
 ### 2.1 Browser — audio capture
 
-The browser (`index.html`) uses the Web Audio API:
+The browser ([voice-ai.darshpatil.site](https://voice-ai.darshpatil.site)) uses the Web Audio API:
 - `getUserMedia({ echoCancellation: true })` opens the mic (echo cancellation is why the
   server-side echo cooldown can be as short as 0.3s).
 - Captures ~4096-sample chunks (~85 ms) at the native rate (usually 48 kHz), converts
@@ -165,10 +165,12 @@ This is where the agent thinks, remembers, and grounds itself. On each user turn
 
 Inside `stream_agent()`:
 - **System prompt** = base persona + emotion addendum + language instruction + up to **3
-  approved Dream-Engine improvements** + earlier-conversation summary.
+  approved Dream-Engine improvements** (via **Hybrid KAG+RAG** lookup — see §6) +
+  earlier-conversation summary.
 - **RAG gate** (`_should_retrieve`): rule-based, zero-latency, zero-token. Skips retrieval
   for pure confirmations/greetings ("yes", "no", "thanks", "हाँ", "नाही"…); triggers it only
-  when knowledge keywords appear. RAG runs **in parallel** with a **1.5 s timeout** — if it's
+  when knowledge keywords appear. RAG context retrieval and Dream-Engine addenda retrieval
+  run **concurrently** via `asyncio.create_task` with a **1.5 s timeout** each — if either is
   slow, the agent answers without it rather than making the customer wait.
 - **Streaming + sentence splitting:** splits on `.?!` + whitespace, Devanagari danda `।॥`, or
   newlines; secondary split on commas only if the clause has ≥3 words; force-flushes at 40
@@ -352,10 +354,11 @@ answer, logs a **knowledge gap** (and a better-query hint) to `improvement_log`.
 they aren't re-analyzed (Bug #8).
 
 **Cycle 3 — PromptImprovement** — *write a better instruction (the real magic).*
-Clusters failing turns → asks the LLM to **propose one system-prompt addendum** per cluster →
-a separate **LLM judge** checks it against held-out failures. Only proposals clearing
-`MIN_JUDGE_SCORE (0.6)` are stored in `improvement_log` with `category="prompt", approved=True`.
-This propose→judge→approve gate stops the agent teaching itself bad habits.
+Clusters failing turns → asks the LLM to **propose one system-prompt addendum** per cluster
+(including a **topic tag** for KAG classification) → a separate **LLM judge** checks it
+against held-out failures. Only proposals clearing `MIN_JUDGE_SCORE (0.6)` are stored in
+`improvement_log` with `category="prompt", approved=True, topic=<detected_topic>`. This
+propose→judge→approve gate stops the agent teaching itself bad habits.
 
 **Cycle 4 — SyntheticQueryGen** — *invent practice problems.*
 From real failures, generates 3 test variants each (adversarial, edge-case, happy-path), stored
@@ -363,8 +366,12 @@ as `customer_id="synthetic"` traces — excluded from real metrics but available
 self-built regression set. Capped at 30 source turns/run.
 
 **Cycle 5 — MemoryConsolidation** — *tidy up.*
-Marks profiles unseen for 90 days as stale, regenerates summaries for frequent callers (≥5
-sessions), flags KB documents never retrieved, and cleans up old synthetic turns.
+Four sub-steps:
+1. Marks profiles unseen for 90 days as stale.
+2. Regenerates summaries for frequent callers (≥5 sessions).
+3. Flags KB documents never retrieved.
+4. **Trace cleanup** — deletes synthetic traces *and* fully-processed real traces older than
+   **30 days** from `execution_traces` to reclaim free-tier Qdrant storage (500 records/batch).
 
 ### 5.3 The safety guard — daily token budget (`app/dream/budget.py`)
 
@@ -385,10 +392,11 @@ backs off **1 hour** (not the usual 5 min) before retrying, since the limit only
 
 ---
 
-## 6. The Self-Improvement Feedback Loop
+## 6. The Self-Improvement Feedback Loop — Hybrid KAG + RAG
 
 The piece that makes this "self"-improvement rather than just analytics: **the live agent reads
-the Dream Engine's approved improvements on every single turn.**
+the Dream Engine's approved improvements on every single turn — using a Hybrid Knowledge-Augmented
+Generation (KAG) + Retrieval-Augmented Generation (RAG) architecture.**
 
 ```
 LIVE VOICE PATH (real time)
@@ -400,13 +408,39 @@ LIVE VOICE PATH (real time)
                               ▼  (offline, only when idle)
 DREAM ENGINE
   Cycle 1 get_unprocessed_turns() → LLM grades → update_eval_score() (dream_processed=True)
-  Cycle 2/3 → propose + judge → improvement_log (category="prompt", approved=True)
+  Cycle 2/3 → propose + judge → improvement_log (category="prompt", approved=True, topic=…)
                               │
                               ▼  (next turn onward — no restart)
 BACK INTO LIVE PATH
-  stream_agent() loads up to 3 approved prompt addenda from improvement_log
-  → appends them to the system prompt → the next customer talks to a better agent
+  stream_agent() → _load_prompt_addenda(query_text)
+    ├─ KAG: _detect_topic(query) → pre-filter improvement_log by topic + "general"
+    └─ RAG: embed query → vector search pre-filtered set → score ≥ 0.70 threshold
+  → up to 3 relevant addenda appended to system prompt → better agent
 ```
+
+### 6.1 How Hybrid KAG + RAG works
+
+`_load_prompt_addenda(query_text)` combines two complementary retrieval strategies:
+
+| Stage | Method | What it does |
+|---|---|---|
+| **KAG pre-filter** | Rule-based topic classifier (`_detect_topic`) | Classifies the user query into topics (billing, network, policy, competitive) and narrows the search space to matching + "general" rules only. |
+| **RAG ranking** | Vector similarity search (e5 embeddings) | Ranks the pre-filtered rules by semantic similarity to the actual user query, keeping only those scoring ≥ **0.70**. |
+
+**Why not pure RAG?** Pure RAG would vector-search *all* approved improvements (every topic)
+and rank purely by embedding similarity. This causes cross-topic pollution: a billing-related
+rule about "never quote prices without checking the KB" might score high for a network query
+about "coverage area" just because both mention "customer" and "plan" — words that are
+embedding-close in a telecom domain. The KAG topic pre-filter eliminates this by narrowing
+the candidate set *before* the vector search runs.
+
+**Why not pure KAG?** A rule-based filter alone can't distinguish which of several
+billing-tagged improvements is most relevant to *this specific* billing question. Semantic
+ranking picks the best 3 from the filtered set.
+
+**Performance:** both RAG context retrieval and KAG+RAG addenda retrieval run **concurrently**
+via `asyncio.create_task` with independent 1.5s timeouts. The embedding call uses an in-process
+LRU cache, so when both paths embed the same query, the second call is a 0ms cache hit.
 
 **A `TurnTrace`** (written by `ExecutionTraceStore.record_turn`, in the `execution_traces`
 collection with a dummy vector) captures everything the Dream Engine needs: `session_id`,
@@ -448,7 +482,7 @@ This system's CLAUDE.md records real hours lost to subtle failures. Here's every
 | **429 / quota exhausted (live voice)** | Sleep 1.5s, retry once; if it still fails, the free tier is likely exhausted → the agent **speaks a localized "we're at capacity, try again shortly" message** (distinct from "didn't catch that"), never dead air. |
 | **Empty reply (model returned nothing)** | Detected and replaced with a **localized fallback phrase** in the user's language (11 languages). |
 | **Reasoning overhead (Dream / Groq only)** | `reasoning_effort="low"` on gpt-oss calls; omitted for Gemini (voice), which has no hidden-reasoning phase. |
-| **Prompt bloat from Dream addenda** | Approved addenda capped at **3 per prompt** (an unbounded list caused a 413). |
+| **Prompt bloat from Dream addenda** | Approved addenda capped at **3 per prompt** via Hybrid KAG+RAG (topic pre-filter + similarity ≥ 0.70 threshold). |
 | **RAG slow on the hot path** | RAG runs in parallel with a **1.5s timeout**; the turn proceeds without it if it's late. |
 | **RAG wasting tokens on chitchat** | `_should_retrieve` gate skips retrieval for confirmations/greetings. |
 | **Long conversations blowing context** | Summarize every **20 turns**; thereafter send only the summary + last 4 messages. |
@@ -464,6 +498,7 @@ This system's CLAUDE.md records real hours lost to subtle failures. Here's every
 | **Customer connects mid-cycle** | Checkpoint saved to Qdrant; resume next idle window. |
 | **A cycle crashes** | Caught and logged; the loop continues to the next cycle rather than dying. |
 | **Any Qdrant/Groq call fails** | Every cloud op is wrapped in try/except — one failure never crashes the loop. |
+| **Free-tier Qdrant storage fills up** | Cycle 5 auto-deletes synthetic + fully-processed real traces older than 30 days (500/batch). |
 
 ### Environment gotcha (documented for maintainers)
 - **OneDrive + `uvicorn --reload` is a trap:** file-change events don't fire reliably on the
@@ -566,7 +601,8 @@ into the image — they're ingested into Qdrant Cloud separately and read at run
 
 ## 11. API Reference
 
-### `GET /` — serves the browser UI (`index.html`).
+### `GET /` — serves the browser UI.
+The frontend is deployed at [voice-ai.darshpatil.site](https://voice-ai.darshpatil.site).
 
 ### `GET /health`
 ```json
@@ -585,8 +621,7 @@ Knowledge gaps the Dream Engine found (from `improvement_log`, `category="knowle
 All Dream-cycle improvements; optional `category` filter (`prompt` / `retrieval` / `knowledge_gap`).
 `→ { "count": int, "improvements": [...] }`
 
-### `POST /voice` (legacy)
-Upload a WAV, get a WAV back. One-shot, **no memory** — kept for compatibility.
+*(The legacy `POST /voice` one-shot endpoint has been removed.)*
 
 ### `WS /ws` — full-duplex real-time voice
 
@@ -615,9 +650,10 @@ Voice-AI-Agent/
 │   ├── main.py               # FastAPI app, WebSocket handler, lifespan wiring
 │   ├── config.py             # Single source of truth: models, budgets, thresholds
 │   ├── pipecat_pipeline.py   # VAD/STT/TTS processors + VoicePipelineManager
-│   ├── langgraph_flow.py     # stream_agent() — the LLM brain (prompt, RAG gate, streaming)
+│   ├── langgraph_flow.py     # stream_agent() — the LLM brain (prompt, Hybrid KAG+RAG, streaming)
 │   ├── memory.py             # LangGraph MemorySaver (per-connection conversation memory)
 │   ├── store.py              # QdrantStore wrapper — ALL vector DB ops go through here
+│   ├── observability.py      # LangSmith tracing + eval client (optional)
 │   ├── num_to_words.py       # Digit → spoken words (11 languages) for correct TTS prices
 │   │
 │   ├── knowledge/            # RAG layer
@@ -627,19 +663,19 @@ Voice-AI-Agent/
 │   │
 │   ├── dream/                # Self-improvement engine
 │   │   ├── engine.py         #   DreamEngine: idle detection, pause/resume, cycle rotation
-│   │   ├── cycles.py         #   The 5 cycles + shared LLM helpers
+│   │   ├── cycles.py         #   The 5 cycles + shared LLM helpers + trace cleanup
 │   │   └── budget.py         #   DreamTokenBudget: hard daily token cap
 │   │
-│   └── tracing/              # Execution traces + observability
-│       ├── trace_store.py    #   ExecutionTraceStore + TurnTrace (feeds the Dream Engine)
-│       └── langsmith_setup.py#   Optional LangSmith tracing
+│   └── tracing/              # Execution traces
+│       └── trace_store.py    #   ExecutionTraceStore + TurnTrace (feeds the Dream Engine)
 │
-├── index.html                # Browser UI (mic capture, chat, audio playback)
 ├── requirements.txt
 ├── Dockerfile                # HF Spaces / Docker (CPU torch, Silero prebake, port 7860)
 ├── CLAUDE.md                 # Engineering standing orders for this repo
 └── README.md                 # This file
 ```
+
+The browser frontend is deployed separately at [voice-ai.darshpatil.site](https://voice-ai.darshpatil.site).
 
 ---
 
@@ -647,7 +683,7 @@ Voice-AI-Agent/
 
 | Layer | Tool |
 |---|---|
-| Frontend | Vanilla JS + Web Audio API |
+| Frontend | Vanilla JS + Web Audio API ([voice-ai.darshpatil.site](https://voice-ai.darshpatil.site)) |
 | Web framework / server | FastAPI + Uvicorn |
 | Voice pipeline | Pipecat (frame-based) |
 | VAD | Silero VAD (PyTorch, CPU) |

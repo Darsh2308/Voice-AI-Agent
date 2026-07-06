@@ -74,32 +74,66 @@ def set_qdrant_store(store) -> None:
     logger.info("QdrantStore wired into langgraph_flow ✓")
 
 
-async def _load_prompt_addenda() -> list[str]:
+async def _load_prompt_addenda(query_text: str | None = None) -> list[str]:
     """
-    Phase 6: Load approved system-prompt improvements from the Dream Engine.
+    Phase 6: Load approved system-prompt improvements from the Dream Engine,
+    performing a hybrid KAG + RAG lookup based on the query topic and similarity.
 
     Returns a list of addendum strings from improvement_log where
-    category="prompt" and approved=True.  Called once per stream_agent() call
-    so any improvement approved during a dream cycle is automatically picked up
-    in the very next conversation — no restart required.
-
-    Returns an empty list if the store isn't wired in or if the query fails.
+    category="prompt", approved=True, matching the detected topic, sorted by similarity.
     """
     if _qdrant_store is None:
         return []
     try:
         from app.store import IMPROVEMENT_LOG
-        records, _ = await _qdrant_store.scroll(
-            IMPROVEMENT_LOG,
-            filter=_qdrant_store.filter_eq("category", "prompt"),
-            limit=20,
-        )
-        addenda = [
-            r["payload"]["improvement_desc"]
-            for r in records
-            if r["payload"].get("approved") is True
-            and r["payload"].get("improvement_desc")
+        from app.knowledge.embedder import embed_text
+        from app.knowledge.retriever import _detect_topic
+
+        # 1. KAG Pre-Filter Setup (Topic classification)
+        topics = _detect_topic(query_text) if query_text else None
+        conditions = [
+            _qdrant_store.filter_eq("category", "prompt"),
+            _qdrant_store.filter_eq("approved", True),
         ]
+        
+        if topics:
+            # Query rules tagged with the matched topics or general rules
+            topic_list = list(topics)
+            if "general" not in topic_list:
+                topic_list.append("general")
+            conditions.append(_qdrant_store.filter_in("topic", topic_list))
+            
+        filt = _qdrant_store.filter_and(*conditions)
+
+        # 2. RAG Semantic Ranking
+        if query_text:
+            # embed_text hits cache instantly since the main RAG step also calls it
+            query_vector = await embed_text(query_text, prefix="query")
+            records = await _qdrant_store.search(
+                collection=IMPROVEMENT_LOG,
+                vector=query_vector,
+                filter=filt,
+                limit=3,
+            )
+            # Filter by a similarity score threshold (0.70) to ensure relevance
+            addenda = [
+                r["payload"]["improvement_desc"]
+                for r in records
+                if r["payload"].get("improvement_desc") and r.get("score", 0.0) >= 0.70
+            ]
+        else:
+            # Fallback scroll if no user query is available yet (e.g. initialization)
+            records, _ = await _qdrant_store.scroll(
+                IMPROVEMENT_LOG,
+                filter=filt,
+                limit=3,
+            )
+            addenda = [
+                r["payload"]["improvement_desc"]
+                for r in records
+                if r["payload"].get("improvement_desc")
+            ]
+            
         return addenda
     except Exception as exc:
         logger.warning(f"_load_prompt_addenda: failed (non-fatal): {exc}")
@@ -916,15 +950,22 @@ async def stream_agent(
     # Effective reply language: an active lock wins over per-turn detection.
     effective_language = locked_language or language
 
+    # ── Phase 2+4+6: Parallel RAG Context + KAG/RAG Prompt Addenda retrieval ────
+    # Start both tasks in background to run concurrently.
+    _rag_task = None
+    if _retrieval_pipeline is not None and _should_retrieve(user_text):
+        _rag_task = asyncio.create_task(_retrieve_context(user_text, effective_language))
+    else:
+        logger.debug(f"stream_agent: RAG skipped (no knowledge keywords in {user_text[:40]!r})")
+
+    _addenda_task = asyncio.create_task(_load_prompt_addenda(user_text))
+
     # ── 2. Build system prompt ────────────────────────────────────────────────
     system = BASE_SYSTEM_PROMPT + EMOTION_ADDENDA.get(emotion_hint, "")
 
-    # Phase 6: append Dream Engine approved improvements (non-fatal if unavailable)
-    # Cap at 3 addenda — every one is added to EVERY prompt on EVERY turn, so an
-    # unbounded list silently bloats the token count and contributed to the 413
-    # "request too large" error. 3 most-relevant improvements is plenty.
+    # Await the prompt addenda rules (usually very fast as it hits cache)
     try:
-        addenda = (await _load_prompt_addenda())[:3]
+        addenda = await asyncio.wait_for(_addenda_task, timeout=1.0)
         for addendum in addenda:
             system += f"\n{addendum}"
         if addenda:
@@ -971,14 +1012,7 @@ async def stream_agent(
 
     retrieved_docs: list[dict] = []
 
-    # Start RAG in background (non-blocking) — ONLY if the query actually needs
-    # knowledge-base facts. Chitchat / confirmations skip RAG entirely, which
-    # keeps the prompt small and avoids blowing the per-minute token limit.
-    _rag_task = None
-    if _retrieval_pipeline is not None and _should_retrieve(user_text):
-        _rag_task = asyncio.create_task(_retrieve_context(user_text, effective_language))
-    else:
-        logger.debug(f"stream_agent: RAG skipped (no knowledge keywords in {user_text[:40]!r})")
+    # _rag_task was already started in parallel at Phase 2+4+6 above.
 
     # Build base api_messages WITHOUT RAG context yet
     api_messages = [{"role": "system", "content": system}]
