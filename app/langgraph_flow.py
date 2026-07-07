@@ -39,9 +39,12 @@ which is necessary because ainvoke() would re-run the LLM (defeating streaming).
 import asyncio
 import json
 import re
+import time
+from dataclasses import dataclass
 from typing import Annotated, AsyncGenerator, List
 
-from openai import AsyncOpenAI
+import httpx
+from openai import APITimeoutError, AsyncOpenAI
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -74,67 +77,158 @@ def set_qdrant_store(store) -> None:
     logger.info("QdrantStore wired into langgraph_flow ✓")
 
 
-async def _load_prompt_addenda(query_text: str | None = None) -> list[str]:
-    """
-    Phase 6: Load approved system-prompt improvements from the Dream Engine,
-    performing a hybrid KAG + RAG lookup based on the query topic and similarity.
+# ─────────────────────────────────────────────────────────────────────────────
+# Dream Engine prompt-addenda cache
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS: _load_prompt_addenda used to hit Qdrant Cloud (embed the
+# query, then a filtered vector search on improvement_log) on EVERY voice
+# turn — even pure chit-chat turns that skip the real RAG gate entirely.
+# improvement_log is only ever written by the offline Dream Engine, at most
+# once every DREAM_CYCLE_INTERVAL_SECS (300s, see config.py), so a live call
+# was paying a fresh network round-trip for data that cannot possibly have
+# changed since the previous turn. Against the LangSmith traces that flagged
+# this investigation, that unconditional per-turn round-trip (up to its own
+# 1.0s wait_for cap) was the single largest contributor to baseline latency —
+# present on almost every turn, RAG-gated or not.
+#
+# Fix: cache the full approved-addenda set (with embeddings) in memory,
+# refreshed off the hot path — once at startup (prime_dream_addenda_cache) and
+# lazily in the background thereafter. A live turn only ever reads the
+# in-memory cache and re-ranks locally by cosine similarity — zero network
+# calls, same ranking behavior as the original per-turn Qdrant search.
+# Worst-case staleness is _ADDENDA_CACHE_TTL_SECS, well inside the 300s
+# cadence at which new addenda can even appear.
 
-    Returns a list of addendum strings from improvement_log where
-    category="prompt", approved=True, matching the detected topic, sorted by similarity.
+_ADDENDA_CACHE_TTL_SECS = 90.0
+
+
+@dataclass
+class _CachedAddendum:
+    topic:  str
+    text:   str
+    vector: list[float]
+
+
+_addenda_cache: list[_CachedAddendum] = []
+_addenda_cache_at: float = 0.0            # time.monotonic() of last successful refresh
+_addenda_refresh_inflight: bool = False   # prevents stacking concurrent refreshes
+
+
+async def _refresh_addenda_cache() -> None:
     """
-    if _qdrant_store is None:
-        return []
+    Fetch the full approved prompt-addenda set from Qdrant and repopulate the
+    in-memory cache. Called at startup (prime_dream_addenda_cache) and lazily
+    from _load_prompt_addenda when the cache goes stale — always detached from
+    the per-turn hot path via asyncio.create_task, never awaited by a live turn.
+    """
+    global _addenda_cache, _addenda_cache_at, _addenda_refresh_inflight
+    if _qdrant_store is None or _addenda_refresh_inflight:
+        return
+    _addenda_refresh_inflight = True
     try:
         from app.store import IMPROVEMENT_LOG
-        from app.knowledge.embedder import embed_text
-        from app.knowledge.retriever import _detect_topic
 
-        # 1. KAG Pre-Filter Setup (Topic classification)
-        topics = _detect_topic(query_text) if query_text else None
-        conditions = [
+        filt = _qdrant_store.filter_and(
             _qdrant_store.filter_eq("category", "prompt"),
             _qdrant_store.filter_eq("approved", True),
+        )
+        records, _ = await _qdrant_store.scroll(
+            IMPROVEMENT_LOG, filter=filt, limit=200, with_vectors=True,
+        )
+        fresh = [
+            _CachedAddendum(
+                topic  = r["payload"].get("topic", "general"),
+                text   = r["payload"]["improvement_desc"],
+                vector = r.get("vector") or [],
+            )
+            for r in records
+            if r["payload"].get("improvement_desc") and r.get("vector")
         ]
-        
-        if topics:
-            # Query rules tagged with the matched topics or general rules
-            topic_list = list(topics)
-            if "general" not in topic_list:
-                topic_list.append("general")
-            conditions.append(_qdrant_store.filter_in("topic", topic_list))
-            
-        filt = _qdrant_store.filter_and(*conditions)
+        _addenda_cache = fresh
+        _addenda_cache_at = time.monotonic()
+        logger.info(f"Dream addenda cache refreshed: {len(fresh)} approved entries")
+    except Exception as exc:
+        # Stale-if-error: keep serving whatever was cached before rather than
+        # going empty on a transient Qdrant blip.
+        logger.warning(f"_refresh_addenda_cache: failed (serving stale cache): {exc}")
+    finally:
+        _addenda_refresh_inflight = False
 
-        # 2. RAG Semantic Ranking
-        if query_text:
-            # embed_text hits cache instantly since the main RAG step also calls it
-            query_vector = await embed_text(query_text, prefix="query")
-            records = await _qdrant_store.search(
-                collection=IMPROVEMENT_LOG,
-                vector=query_vector,
-                filter=filt,
-                limit=3,
-            )
-            # Filter by a similarity score threshold (0.70) to ensure relevance
-            addenda = [
-                r["payload"]["improvement_desc"]
-                for r in records
-                if r["payload"].get("improvement_desc") and r.get("score", 0.0) >= 0.70
-            ]
-        else:
-            # Fallback scroll if no user query is available yet (e.g. initialization)
-            records, _ = await _qdrant_store.scroll(
-                IMPROVEMENT_LOG,
-                filter=filt,
-                limit=3,
-            )
-            addenda = [
-                r["payload"]["improvement_desc"]
-                for r in records
-                if r["payload"].get("improvement_desc")
-            ]
-            
-        return addenda
+
+async def prime_dream_addenda_cache() -> None:
+    """
+    Eagerly populate the addenda cache at app startup so the FIRST live voice
+    turn isn't the one paying the Qdrant round-trip. Call from main.py's
+    lifespan right after set_qdrant_store(). Safe to fail — the cache
+    self-heals via the periodic background refresh below.
+    """
+    await _refresh_addenda_cache()
+
+
+def _maybe_schedule_addenda_refresh() -> None:
+    """Fire-and-forget a background refresh once the cache goes stale. Never
+    awaited by a live turn — stream_agent always reads whatever is cached
+    right now, even if that means serving a slightly stale (<= TTL) result."""
+    if time.monotonic() - _addenda_cache_at < _ADDENDA_CACHE_TTL_SECS:
+        return
+    if _addenda_refresh_inflight:
+        return
+    asyncio.create_task(_refresh_addenda_cache(), name="dream-addenda-refresh")
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two equal-length vectors. embed_text()
+    L2-normalizes its output, but this computes it explicitly rather than
+    assuming that, so it stays correct if that ever changes."""
+    if not a or not b:
+        return 0.0
+    num = sum(x * y for x, y in zip(a, b))
+    da  = sum(x * x for x in a) ** 0.5
+    db  = sum(y * y for y in b) ** 0.5
+    if da == 0.0 or db == 0.0:
+        return 0.0
+    return num / (da * db)
+
+
+async def _load_prompt_addenda(query_text: str | None = None) -> list[str]:
+    """
+    Phase 6: Return approved system-prompt improvements from the Dream Engine
+    relevant to query_text — a hybrid KAG (topic pre-filter) + RAG (semantic
+    re-rank) lookup, same behavior as the original per-turn Qdrant version,
+    but served entirely from the in-memory cache above. Zero network calls
+    on the per-turn hot path.
+    """
+    _maybe_schedule_addenda_refresh()
+    if not _addenda_cache:
+        return []
+
+    try:
+        from app.knowledge.retriever import _detect_topic
+
+        # 1. KAG Pre-Filter (topic classification) — match the query's
+        # topic(s) plus anything tagged "general", same as the original filter.
+        topics = _detect_topic(query_text) if query_text else None
+        candidates = _addenda_cache
+        if topics:
+            topic_set = set(topics) | {"general"}
+            candidates = [c for c in _addenda_cache if c.topic in topic_set]
+        if not candidates:
+            return []
+
+        # 2. RAG semantic re-rank — local cosine, no Qdrant call.
+        if not query_text:
+            # Initialization path: no query yet to rank against.
+            return [c.text for c in candidates[:3]]
+
+        from app.knowledge.embedder import embed_text
+        query_vector = await embed_text(query_text, prefix="query")
+        scored = sorted(
+            ((c, _cosine(query_vector, c.vector)) for c in candidates),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        # Same 0.70 similarity threshold as the original Qdrant-side filter.
+        return [c.text for c, score in scored[:3] if score >= 0.70]
     except Exception as exc:
         logger.warning(f"_load_prompt_addenda: failed (non-fatal): {exc}")
         return []
@@ -159,7 +253,23 @@ except ImportError:
 # the same streaming/tool-call object shape the parsing below expects, so this
 # is a drop-in for the previous Groq client. Kept on a separate provider from
 # the Dream Engine (Groq) so their free-tier pools are independent.
-_voice_llm = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+#
+# Explicit timeout + max_retries=0: the SDK default (600s request timeout,
+# 5s connect, max_retries=2 with backoff) gave a slow/hung Gemini response NO
+# local guard — a live call could silently stall for minutes with dead air on
+# the line. `read=5.0` is a per-chunk stall timeout — httpx resets it every
+# time a byte arrives, so it only trips when the connection goes fully silent,
+# never on a legitimately slower-but-still-streaming reply. max_retries=0
+# hands ALL retry behavior to the explicit bounded retry in stream_agent's
+# _open_stream error handling below — stacking the SDK's own backoff on top of
+# that would compound delays instead of bounding them.
+_VOICE_LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
+_voice_llm = AsyncOpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url=GEMINI_BASE_URL,
+    timeout=_VOICE_LLM_TIMEOUT,
+    max_retries=0,
+)
 
 
 def _voice_reasoning_kwargs() -> dict:
@@ -964,9 +1074,13 @@ async def stream_agent(
     # ── 2. Build system prompt ────────────────────────────────────────────────
     system = BASE_SYSTEM_PROMPT + EMOTION_ADDENDA.get(emotion_hint, "")
 
-    # Await the prompt addenda rules (usually very fast as it hits cache)
+    # Await the prompt addenda rules — now served from the in-memory cache
+    # (see _load_prompt_addenda above), so this resolves in low milliseconds:
+    # a cache lookup + local cosine re-rank, zero network calls. 0.3s is a
+    # generous safety margin for a pathological embed-thread stall, not a
+    # routine wait like the old 1.0s Qdrant round-trip cap was.
     try:
-        addenda = await asyncio.wait_for(_addenda_task, timeout=1.0)
+        addenda = await asyncio.wait_for(_addenda_task, timeout=0.3)
         for addendum in addenda:
             system += f"\n{addendum}"
         if addenda:
@@ -1092,14 +1206,18 @@ async def stream_agent(
         )
 
     stream = None
-    # Set when the voice LLM's rate limit / free-tier quota is exhausted and the
-    # bounded retry still fails. Drives a distinct "we're at capacity" message
-    # (vs the generic "didn't catch that") in the empty-reply guard below.
+    # Set when the voice LLM's rate limit / free-tier quota is exhausted, OR
+    # the call timed out (see _VOICE_LLM_TIMEOUT above), and the bounded retry
+    # still fails. Drives a distinct "we're at capacity" message (vs the
+    # generic "didn't catch that") in the empty-reply guard below — a hung/
+    # timed-out call deserves the same honest "service is degraded" framing as
+    # a quota error, not the transcription-sounding fallback phrase.
     quota_exhausted = False
     try:
         stream = await _open_stream(api_messages)
     except Exception as _llm_exc:
         _msg = str(_llm_exc).lower()
+        is_timeout = isinstance(_llm_exc, APITimeoutError) or "timeout" in _msg or "timed out" in _msg
         if "413" in _msg or "too large" in _msg:
             logger.warning(
                 "stream_agent: request too large (TPM) — retrying without RAG context"
@@ -1113,21 +1231,28 @@ async def stream_agent(
             except Exception as _retry_exc:
                 logger.error(f"stream_agent: 413 retry also failed: {_retry_exc}")
                 stream = None
-        elif any(k in _msg for k in ("429", "rate", "too many", "quota", "resource_exhausted", "exhausted")):
-            # Voice LLM hit a rate/quota limit. Retry ONCE after a short bounded
-            # sleep (the SDK already retried transient blips, so this is brief
-            # real contention — e.g. a per-minute burst). If it STILL fails, the
-            # free-tier quota is likely exhausted: flag it so the guard below
-            # speaks a graceful "we're at capacity" message instead of dead air
-            # or a misleading "didn't catch that". (Bug #13)
-            logger.warning("stream_agent: rate/quota limit — one bounded retry after 1.5s")
+        elif is_timeout or any(
+            k in _msg for k in ("429", "rate", "too many", "quota", "resource_exhausted", "exhausted")
+        ):
+            # Voice LLM hit a rate/quota limit, or the call itself timed out
+            # (Gemini went silent past _VOICE_LLM_TIMEOUT's read window — see
+            # the client construction above). Retry ONCE after a short bounded
+            # sleep (this is brief real contention/a one-off stall, not a
+            # sustained outage). If it STILL fails, the service is degraded:
+            # flag it so the guard below speaks a graceful "we're at capacity"
+            # message instead of dead air or a misleading "didn't catch that".
+            # (Bug #13)
+            logger.warning(
+                f"stream_agent: LLM call failed ({type(_llm_exc).__name__}, "
+                f"timeout={is_timeout}) — one bounded retry after 1.5s"
+            )
             await asyncio.sleep(1.5)
             try:
                 stream = await _open_stream(api_messages)
             except Exception as _retry_exc:
                 logger.error(
-                    f"stream_agent: rate/quota retry failed — voice LLM free tier "
-                    f"likely exhausted: {_retry_exc}"
+                    f"stream_agent: retry also failed ({type(_retry_exc).__name__}) — "
+                    f"voice LLM degraded/quota likely exhausted: {_retry_exc}"
                 )
                 stream = None
                 quota_exhausted = True
@@ -1143,46 +1268,62 @@ async def stream_agent(
     # stream is None only if opening it failed after retries (413/429) — leave
     # full_response empty so the empty-reply guard (§4b) speaks a localized
     # fallback instead of the caller hearing dead air.
-    async for chunk in (stream or _empty_aiter()):
-        choice       = chunk.choices[0]
-        delta        = choice.delta
+    #
+    # The iteration itself is wrapped in try/except: the try/except around
+    # _open_stream() above only guards the INITIAL request (connect + headers).
+    # A stall or dropped connection DURING streaming — e.g. Gemini goes silent
+    # mid-reply past _VOICE_LLM_TIMEOUT's 5s read window — raises HERE, not
+    # there. Whatever text already streamed survives in full_response/
+    # word_buffer, so the flush-remaining-buffer step and the §4b empty-reply
+    # guard below still turn this into a partial spoken reply (or a graceful
+    # fallback phrase if nothing arrived at all) instead of an uncaught
+    # exception that would silently kill the turn.
+    try:
+        async for chunk in (stream or _empty_aiter()):
+            choice       = chunk.choices[0]
+            delta        = choice.delta
 
-        # ── Tool-call delta: accumulate function name + arguments ─────────────
-        if delta.tool_calls:
-            is_tool_call = True
-            for tc_delta in delta.tool_calls:
-                idx = tc_delta.index
-                if idx not in tool_calls_acc:
-                    tool_calls_acc[idx] = {
-                        "id":       "",
-                        "type":     "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                if tc_delta.id:
-                    tool_calls_acc[idx]["id"] = tc_delta.id
-                if tc_delta.function:
-                    if tc_delta.function.name:
-                        tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
-                    if tc_delta.function.arguments:
-                        tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+            # ── Tool-call delta: accumulate function name + arguments ─────────────
+            if delta.tool_calls:
+                is_tool_call = True
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id":       "",
+                            "type":     "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    if tc_delta.id:
+                        tool_calls_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
 
-        # ── Content token: flush on sentence boundaries ───────────────────────
-        elif delta.content:
-            token         = delta.content
-            full_response += token
-            word_buffer   += token
-            chunks, word_buffer = _flush_sentences(word_buffer)
-            # Fallback: flush if the buffer grows very long with no sentence boundary.
-            # Threshold is high (40 words) so it only fires for truly unpunctuated
-            # responses — normal sentences with . ? ! । should split cleanly above.
-            if not chunks and len(word_buffer.split()) >= 40:
-                chunks    = [word_buffer.strip()]
-                word_buffer = ""
-            for c in chunks:
-                clean = _strip_end_call(_strip_tool_markup(c))
-                if clean.strip():
-                    logger.info(f"stream_agent: yielding sentence → {clean.strip()!r}")
-                    yield clean.strip()
+            # ── Content token: flush on sentence boundaries ───────────────────────
+            elif delta.content:
+                token         = delta.content
+                full_response += token
+                word_buffer   += token
+                chunks, word_buffer = _flush_sentences(word_buffer)
+                # Fallback: flush if the buffer grows very long with no sentence boundary.
+                # Threshold is high (40 words) so it only fires for truly unpunctuated
+                # responses — normal sentences with . ? ! । should split cleanly above.
+                if not chunks and len(word_buffer.split()) >= 40:
+                    chunks    = [word_buffer.strip()]
+                    word_buffer = ""
+                for c in chunks:
+                    clean = _strip_end_call(_strip_tool_markup(c))
+                    if clean.strip():
+                        logger.info(f"stream_agent: yielding sentence → {clean.strip()!r}")
+                        yield clean.strip()
+    except Exception as _stream_exc:
+        logger.error(
+            f"stream_agent: LLM stream interrupted mid-turn "
+            f"({type(_stream_exc).__name__}): {_stream_exc}"
+        )
 
     # Flush any remaining text after the stream ends (no-tool path)
     if not is_tool_call and word_buffer.strip():

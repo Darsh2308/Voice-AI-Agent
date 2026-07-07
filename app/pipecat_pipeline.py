@@ -216,6 +216,18 @@ class BargeInDetectedFrame(Frame):
     pass
 
 
+class NoSpeechDetectedFrame(Frame):
+    """
+    Emitted by SarvamSTTService when an utterance transcribes to nothing
+    usable (empty, too short, or a bare filler word — see FILLER_WORDS).
+    Normally this is just noise being filtered. But if it followed a
+    barge-in, it means the "interruption" wasn't real speech: consumed by
+    GroqLangGraphProcessor to RESUME any AI turn that was paused for that
+    barge-in instead of silently abandoning it. A no-op if no turn is paused.
+    """
+    pass
+
+
 class LLMTurnDoneFrame(Frame):
     """
     Emitted by GroqLangGraphProcessor after all TextFrames for a turn have
@@ -292,6 +304,18 @@ class VADProcessor(FrameProcessor):
     SILENCE_CHUNKS_BARGEIN = 4  # Feature 4: faster end-of-speech during barge-in
     MAX_BUFFER_CHUNKS    = 180  # ~15 s safety cap (longer sentences now allowed)
 
+    # ── Noise-rejection energy gate ───────────────────────────────────────────
+    # Silero's probability alone occasionally scores broadband ambient noise
+    # (fans, distant traffic/chatter, hums) at or above SPEECH_THRESHOLD. A
+    # chunk must ALSO be meaningfully louder than the learned ambient noise
+    # floor (_noise_floor_energy) to count as speech. Starting points — tune
+    # against real call logs (VAD: rejected noise-like chunk / VAD: BARGE-IN
+    # fired debug/info lines) if false triggers persist or real speech gets
+    # rejected.
+    NOISE_FLOOR_ALPHA      = 0.05   # slow EMA — one loud moment shouldn't raise the floor
+    ENERGY_GATE_MULTIPLIER = 1.6    # a chunk must be this many× louder than the floor
+    MIN_ABSOLUTE_ENERGY    = 150.0  # floor for a near-silent room where noise_floor≈0
+
     # ── Sample rate constants ─────────────────────────────────────────────────
     TARGET_SAMPLE_RATE   = 16000  # Silero and Sarvam ASR both expect 16 kHz
 
@@ -305,6 +329,10 @@ class VADProcessor(FrameProcessor):
         self._energy_sum = 0.0
         self._energy_count = 0
         self._energy_baseline = 0.0   # rolling average of normal speech energy
+        # Ambient noise-floor estimate for the energy gate — persists across
+        # utterances for the life of the connection (NOT reset in
+        # _reset_vad_state, unlike the per-utterance buffers below).
+        self._noise_floor_energy = 0.0
         self._reset_vad_state()
 
     def update_sample_rate(self, rate: int):
@@ -340,13 +368,29 @@ class VADProcessor(FrameProcessor):
     # ── Resampling ────────────────────────────────────────────────────────────
 
     def _resample(self, pcm_bytes: bytes) -> bytes:
-        """Downsample from browser rate to 16 kHz using integer decimation."""
+        """Downsample from browser rate to 16 kHz.
+
+        Averages each source block instead of picking a single nearest sample
+        (naive decimation). Decimation left frequency content above the new
+        Nyquist rate (8 kHz) unfiltered, which aliases down into the audible
+        band and degrades the signal Silero sees — contributing to spurious
+        speech-probability spikes on non-speech audio. Block-averaging is a
+        cheap box-car low-pass that meaningfully reduces that aliasing without
+        pulling in a DSP dependency (e.g. scipy) just for this.
+        """
         if self._browser_rate == self.TARGET_SAMPLE_RATE:
             return pcm_bytes
         ratio = self._browser_rate / self.TARGET_SAMPLE_RATE
         samples = array.array('h', pcm_bytes[:len(pcm_bytes) & ~1])
         out_len = int(len(samples) / ratio)
-        out = array.array('h', (samples[int(i * ratio)] for i in range(out_len)))
+        out = array.array('h')
+        for i in range(out_len):
+            start = int(i * ratio)
+            end   = min(int((i + 1) * ratio), len(samples))
+            if end <= start:
+                end = start + 1
+            block = samples[start:end]
+            out.append(sum(block) // len(block) if block else 0)
         return out.tobytes()
 
     # ── Silero inference ──────────────────────────────────────────────────────
@@ -403,19 +447,65 @@ class VADProcessor(FrameProcessor):
         else:
             await self.push_frame(frame, direction)
 
+    def _resample_and_score(self, raw_pcm: bytes) -> tuple[bytes, float]:
+        """Resample to 16 kHz and run Silero inference. Both are CPU-bound, so
+        they're done together in ONE executor call (see _process_audio_chunk)
+        — previously only the Silero call was offloaded, leaving resampling on
+        the event loop."""
+        pcm_16k = self._resample(raw_pcm)
+        prob = self._speech_prob(pcm_16k)
+        return pcm_16k, prob
+
+    def _chunk_energy(self, pcm_16k: bytes) -> float:
+        """Mean absolute amplitude of a 16-kHz PCM chunk — a cheap loudness proxy
+        used by the noise-rejection energy gate below."""
+        samples = array.array('h', pcm_16k[:len(pcm_16k) & ~1])
+        return sum(abs(s) for s in samples) / len(samples) if samples else 0.0
+
     async def _process_audio_chunk(self, raw_pcm: bytes):
         """Run one chunk of browser audio through the Silero VAD state machine."""
-        pcm_16k = self._resample(raw_pcm)
-        # Silero inference is CPU-bound torch work (~12×/sec). Running it inline
-        # blocked the event loop, adding jitter to audio delivery and slowing
-        # barge-in during playback (Bug #10). Offload to the default thread pool
-        # so the loop stays free for WebSocket/HTTP I/O. Safe because chunks are
-        # processed strictly one at a time (process_frame awaits each in order),
-        # so the _silero_leftover state carried across calls is never raced.
+        # Silero inference (and now resampling too) is CPU-bound torch/array
+        # work (~12×/sec). Running it inline blocked the event loop, adding
+        # jitter to audio delivery and slowing barge-in during playback
+        # (Bug #10). Offload both to the default thread pool so the loop stays
+        # free for WebSocket/HTTP I/O. Safe because chunks are processed
+        # strictly one at a time (process_frame awaits each in order), so the
+        # _silero_leftover state carried across calls is never raced.
         loop = asyncio.get_running_loop()
-        prob = await loop.run_in_executor(None, self._speech_prob, pcm_16k)
+        pcm_16k, prob = await loop.run_in_executor(None, self._resample_and_score, raw_pcm)
+        energy = self._chunk_energy(pcm_16k)
 
-        if prob >= self.SPEECH_THRESHOLD:
+        # ── Adaptive noise-floor calibration ──────────────────────────────────
+        # Continuously learn the room's ambient noise level from chunks Silero
+        # itself scores as non-speech, so the energy gate below adapts to a
+        # quiet room vs. a noisy office instead of using one fixed global
+        # amplitude threshold. Slow EMA (persists across utterances — NOT
+        # reset in _reset_vad_state) so one loud moment doesn't quickly raise
+        # the floor and mask genuine speech right after it.
+        if prob < self.SPEECH_THRESHOLD:
+            self._noise_floor_energy = (
+                energy if self._noise_floor_energy == 0.0
+                else (1 - self.NOISE_FLOOR_ALPHA) * self._noise_floor_energy
+                     + self.NOISE_FLOOR_ALPHA * energy
+            )
+
+        # A chunk counts as speech only if Silero's probability AND a loudness
+        # sanity check both agree. Silero alone occasionally scores broadband
+        # background noise (fans, distant traffic/chatter, hums) at or above
+        # SPEECH_THRESHOLD; requiring it to also be meaningfully louder than
+        # the learned ambient floor rejects those without a fixed,
+        # environment-specific absolute threshold. Skipped once speech is
+        # already confirmed active — natural mid-utterance dips in volume
+        # (quiet syllables, breaths) shouldn't be second-guessed.
+        energy_gate = max(self.MIN_ABSOLUTE_ENERGY, self._noise_floor_energy * self.ENERGY_GATE_MULTIPLIER)
+        is_speech = prob >= self.SPEECH_THRESHOLD and (self._is_speech_active or energy >= energy_gate)
+        if prob >= self.SPEECH_THRESHOLD and not is_speech:
+            logger.debug(
+                f"VAD: rejected noise-like chunk (prob={prob:.2f} energy={energy:.0f} "
+                f"gate={energy_gate:.0f}) — Silero-positive but too quiet vs. ambient floor"
+            )
+
+        if is_speech:
             # ── SPEECH chunk ─────────────────────────────────────────────────
             self._silence_chunk_count = 0
             self._audio_buffer.append(pcm_16k)
@@ -442,7 +532,8 @@ class VADProcessor(FrameProcessor):
                 self._track_energy(pcm_16k)
 
         else:
-            # ── SILENCE chunk ─────────────────────────────────────────────────
+            # ── SILENCE chunk (or a Silero-positive chunk that failed the
+            # loudness gate — treated the same as silence for state purposes) ──
             if self._is_speech_active:
                 self._silence_chunk_count += 1
                 self._audio_buffer.append(pcm_16k)
@@ -459,6 +550,21 @@ class VADProcessor(FrameProcessor):
                     reason = "silence" if silence_ended else "hard-cap"
                     logger.info(f"VAD: utterance END ({reason}, last_prob={prob:.2f})")
                     await self._emit_utterance()
+            else:
+                # Not yet confirmed speech — a silence/rejected chunk here means
+                # the prior above-threshold chunk(s) were an isolated blip, not
+                # the start of a real utterance. Reset the pre-activation
+                # counter so only TRULY CONSECUTIVE qualifying chunks can cross
+                # MIN_SPEECH_CHUNKS / MIN_SPEECH_CHUNKS_BARGEIN.
+                #
+                # ROOT CAUSE this fixes: previously this branch did nothing, so
+                # _speech_chunks_seen was NEVER reset before activation. Sparse
+                # noise blips (AC cycling, clicks, distant chatter) scattered
+                # across many seconds — with real silence in between — could
+                # silently accumulate past the threshold and falsely trigger an
+                # utterance or a barge-in, even though no chunk was ever part of
+                # a real, continuous utterance.
+                self._speech_chunks_seen = 0
 
     async def _emit_utterance(self):
         """Package buffered audio into WAV and push a SpeechEndFrame downstream."""
@@ -687,6 +793,14 @@ class SarvamSTTService(FrameProcessor):
             cleaned = transcript.lower().rstrip(".,!? ")
             if not cleaned or len(cleaned) <= 2 or cleaned in self.FILLER_WORDS:
                 logger.debug(f"STT: filtered noise/filler {transcript!r}")
+                # This utterance produced nothing usable. If it followed a
+                # barge-in, that barge-in was a false positive (background
+                # noise, not real speech) — NoSpeechDetectedFrame lets
+                # GroqLangGraphProcessor RESUME whatever AI turn got cut off
+                # instead of silently leaving the call in dead air. A no-op
+                # when no turn is paused (e.g. plain background noise between
+                # turns, nothing was interrupted).
+                await self.push_frame(NoSpeechDetectedFrame())
                 return
 
             # ── Emit frames downstream ─────────────────────────────────────
@@ -766,6 +880,14 @@ class GroqLangGraphProcessor(FrameProcessor):
         # per-turn LLM/TTS state (_emotion_hint, _turn_index, TTS turn machinery)
         # (Bug #15).
         self._generate_lock = asyncio.Lock()
+        # Resume-on-false-barge-in: the most recently completed turn's
+        # sentences, kept around in case its audio gets wiped by a barge-in
+        # that turns out to be background noise, not real speech. Set at the
+        # end of every completed turn; only ACTED on (replayed or discarded)
+        # once mark_turn_cancelled() + resolve_pending_interrupt() run — see
+        # those methods for the full flow.
+        self._last_turn:     dict | None = None
+        self._pending_resume: bool       = False
         logger.info(
             f"GroqLangGraphProcessor: thread_id={thread_id} "
             f"session_id={self._session_id[:8]}… trace={'on' if trace_store else 'off'}"
@@ -775,7 +897,18 @@ class GroqLangGraphProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
+            # A real, usable transcript arrived — whatever barge-in was
+            # pending (if any) is now CONFIRMED real speech, not noise. Drop
+            # the cancelled turn we were holding onto for possible resume.
+            await self.resolve_pending_interrupt(real_speech=True)
             await self._generate(frame.text)
+
+        elif isinstance(frame, NoSpeechDetectedFrame):
+            # STT produced nothing usable. If a turn is awaiting resolution
+            # (its audio was just wiped by a barge-in), that barge-in was a
+            # false positive — resume it. No-op if nothing is pending (e.g.
+            # ordinary background noise between turns, nothing was cancelled).
+            await self.resolve_pending_interrupt(real_speech=False)
 
         elif isinstance(frame, EmotionHintFrame):
             # Feature 10: store emotion hint, use it in next LLM call.
@@ -792,6 +925,52 @@ class GroqLangGraphProcessor(FrameProcessor):
 
         else:
             await self.push_frame(frame, direction)
+
+    def mark_turn_cancelled(self) -> None:
+        """
+        Called by VoicePipelineManager.interrupt() (barge-in or manual stop)
+        right after it wipes the current turn's not-yet-delivered audio. Flags
+        the most recently completed turn (_last_turn) as awaiting resolution:
+        resolve_pending_interrupt() decides whether to resume it (false
+        positive) or discard it (genuine interruption) once STT reports back.
+        A no-op if no turn has completed yet (e.g. interrupt during silence).
+        """
+        if self._last_turn is not None:
+            self._pending_resume = True
+            logger.debug("LLM: turn cancellation noted — awaiting STT to confirm real speech vs. false positive")
+
+    async def resolve_pending_interrupt(self, real_speech: bool) -> None:
+        """
+        Resolve a turn cancellation once we know whether the interruption was
+        real. real_speech=True (a usable transcript arrived) → discard the
+        cancelled turn, the new input takes over. real_speech=False (STT
+        found nothing usable) → the "interruption" was background noise, not
+        the user talking: resume the cancelled turn by re-emitting its
+        sentences as fresh TextFrames, exactly as if it had never been cut off.
+        No-op if no turn is currently awaiting resolution.
+        """
+        if not self._pending_resume or self._last_turn is None:
+            return
+        self._pending_resume = False
+        turn, self._last_turn = self._last_turn, None
+
+        if real_speech:
+            logger.info("LLM: barge-in confirmed as real user speech — discarding the cancelled turn")
+            return
+
+        sentences = turn["sentences"]
+        logger.info(
+            f"LLM: barge-in was a false positive (no real speech followed) — "
+            f"resuming {len(sentences)} cancelled sentence(s)"
+        )
+        for sentence in sentences:
+            await self.push_frame(TextFrame(text=sentence))
+        await self.push_frame(
+            TranscriptDisplayFrame(text=" ".join(sentences), speaker="ai")
+        )
+        await self.push_frame(LLMTurnDoneFrame())
+        if turn.get("end_call"):
+            await self.push_frame(EndCallFrame())
 
     async def _generate(self, user_text: str):
         """
@@ -829,6 +1008,7 @@ class GroqLangGraphProcessor(FrameProcessor):
         await self.push_frame(AIThinkingFrame(thinking=True))
 
         full_text      = ""
+        sentences: list[str] = []    # mirrors full_text, for resume-on-false-barge-in
         first_sentence = True
         meta_out: dict = {}          # Phase 2+3: populated by stream_agent
         start_time     = time.monotonic()
@@ -859,6 +1039,7 @@ class GroqLangGraphProcessor(FrameProcessor):
                     first_sentence = False
 
                 full_text += sentence.strip() + " "
+                sentences.append(sentence.strip())
                 logger.info(f"LLM→TTS: pushing TextFrame → {sentence.strip()!r}")
                 await self.push_frame(TextFrame(text=sentence.strip()))
 
@@ -903,6 +1084,13 @@ class GroqLangGraphProcessor(FrameProcessor):
                     logger.error(f"TraceStore.record_turn failed (non-fatal): {trace_exc}")
 
         self._emotion_hint = "neutral"
+
+        # Resume-on-false-barge-in: remember this turn so mark_turn_cancelled()
+        # + resolve_pending_interrupt() can replay it if a barge-in wipes its
+        # audio and then turns out to have been background noise, not real
+        # speech (see those methods above for the full flow).
+        if full_text.strip():
+            self._last_turn = {"sentences": sentences, "end_call": bool(meta_out.get("end_call"))}
 
         logger.info("LLM: pushing LLMTurnDoneFrame sentinel downstream")
         await self.push_frame(LLMTurnDoneFrame())
@@ -1822,6 +2010,12 @@ class VoicePipelineManager:
         """
         # Cancel the in-flight turn (TTS tasks + delivery loop) — non-destructive.
         await self._tts.cancel_turn()
+
+        # Flag the just-cancelled turn as awaiting resolution: if STT then
+        # reports the interrupting audio wasn't real speech (NoSpeechDetectedFrame),
+        # GroqLangGraphProcessor resumes it instead of leaving the reply
+        # silently abandoned. If real speech follows, it's discarded normally.
+        self._llm.mark_turn_cancelled()
 
         # Drain all pending output frames so stale audio/status isn't sent
         drained = 0

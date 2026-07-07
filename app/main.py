@@ -58,7 +58,7 @@ from app.pipecat_pipeline import (
 )
 from app.store import QdrantStore
 from app.config import QDRANT_URL, QDRANT_API_KEY
-from app.langgraph_flow import set_retrieval_pipeline, set_qdrant_store
+from app.langgraph_flow import set_retrieval_pipeline, set_qdrant_store, prime_dream_addenda_cache
 from app.observability import init_langsmith
 from groq import AsyncGroq
 from app.config import GROQ_API_KEY
@@ -92,6 +92,18 @@ async def lifespan(app: FastAPI):
             app.state.retrieval_pipeline = retrieval_pipeline
             set_retrieval_pipeline(retrieval_pipeline)
             set_qdrant_store(store)   # Phase 6: allow stream_agent to load dream addenda
+
+            # Pre-warm the Dream addenda cache so the first live voice turn
+            # doesn't pay the Qdrant round-trip that used to happen on EVERY
+            # turn — see the cache block above _load_prompt_addenda() in
+            # langgraph_flow.py for why this was the dominant per-turn latency
+            # cost. Non-fatal: the cache self-heals via its own periodic
+            # background refresh if this warmup fails or Qdrant is briefly down.
+            try:
+                await prime_dream_addenda_cache()
+                logger.info("Dream addenda cache pre-warmed ✓")
+            except Exception as _addenda_warm_exc:
+                logger.warning(f"Dream addenda cache warmup failed (non-fatal): {_addenda_warm_exc}")
 
             # Pre-warm embedding model at startup so the first voice turn
             # doesn't hit a cold model-load (which takes ~7s and causes RAG timeout)
@@ -329,6 +341,14 @@ async def websocket_endpoint(websocket: WebSocket, request: Request = None):
     # playback, not just the send. We estimate playback end from bytes sent and
     # keep barge_in_mode ON until then via this deferred task.
     barge_off_task: asyncio.Task | None = None
+    # The OPENING greeting must never be interruptible — a stray noise right as
+    # the call connects (or the user just saying "hello?") shouldn't cut off
+    # "Thank you for calling BharatConnect...". This latches True once the
+    # first AI-speaking turn (always the greeting — trigger_greeting() fires
+    # immediately on connect, before any user input can be processed) finishes,
+    # and stays True for the rest of the call; every turn after the greeting
+    # arms barge-in normally.
+    greeting_played: bool = False
 
     manager = VoicePipelineManager(session_id=session_id, trace_store=trace_store)
     await manager.start()
@@ -418,7 +438,7 @@ async def websocket_endpoint(websocket: WebSocket, request: Request = None):
           BargeInDetectedFrame    → Feature 4: auto-interrupt during playback
           EndFrame                → pipeline shutdown — exit loop
         """
-        nonlocal last_ai_finished_at, is_ai_speaking, barge_off_task
+        nonlocal last_ai_finished_at, is_ai_speaking, barge_off_task, greeting_played
 
         # Track audio bytes delivered in the CURRENT speaking turn so that, on an
         # agent-initiated hangup, we can wait for the browser to actually finish
@@ -450,7 +470,11 @@ async def websocket_endpoint(websocket: WebSocket, request: Request = None):
                     if barge_off_task and not barge_off_task.done():
                         barge_off_task.cancel()
                         barge_off_task = None
-                    manager.set_barge_in_mode(True)   # Feature 4
+                    if greeting_played:
+                        manager.set_barge_in_mode(True)   # Feature 4
+                    else:
+                        # The opening greeting is playing — never interruptible.
+                        logger.info("Barge-in disarmed for the opening greeting")
 
                 elif not frame.ai_speaking and is_ai_speaking:
                     # The server has finished SENDING audio, but the browser is
@@ -460,6 +484,11 @@ async def websocket_endpoint(websocket: WebSocket, request: Request = None):
                     # meant speech during playback was ignored until the audio
                     # finished. Schedule the disarm at estimated playback end.
                     is_ai_speaking = False
+                    # This AI-speaking cycle has now finished — if it was the
+                    # opening greeting (greeting_played was still False), every
+                    # turn from here on arms barge-in normally. Idempotent once
+                    # already True.
+                    greeting_played = True
                     play_secs = turn_audio_bytes / SARVAM_AUDIO_BYTES_PER_SEC
                     remaining = max(0.0, play_secs)
 

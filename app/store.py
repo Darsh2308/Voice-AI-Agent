@@ -261,15 +261,20 @@ class QdrantStore:
         filter: Filter | None = None,
         limit: int = 100,
         offset: str | None = None,
+        with_vectors: bool = False,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """
-        Payload-only query (no vector ranking).  Used for non-semantic lookups
-        such as fetching unprocessed traces or customer profiles.
+        Payload-only query (no vector ranking) by default.  Used for
+        non-semantic lookups such as fetching unprocessed traces or customer
+        profiles. Pass with_vectors=True when the caller needs to re-rank
+        results itself (e.g. an in-process cache doing local cosine scoring)
+        without paying a separate search() round-trip per lookup.
 
         Returns (records, next_page_offset).
         Pass next_page_offset back as `offset` to paginate.
 
-        Each record: {"id": ..., "payload": {...}}
+        Each record: {"id": ..., "payload": {...}} — plus "vector": [...] when
+        with_vectors=True.
         """
         records, next_offset = await self._client.scroll(
             collection_name=collection,
@@ -277,9 +282,16 @@ class QdrantStore:
             limit=limit,
             offset=offset,
             with_payload=True,
-            with_vectors=False,
+            with_vectors=with_vectors,
         )
-        items = [{"id": r.id, "payload": r.payload or {}} for r in records]
+        items = [
+            {
+                "id": r.id,
+                "payload": r.payload or {},
+                **({"vector": r.vector} if with_vectors else {}),
+            }
+            for r in records
+        ]
         return items, next_offset
 
     async def update_payload(
