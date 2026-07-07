@@ -100,6 +100,7 @@ _PAYLOAD_INDEXES: dict[str, list[tuple[str, PayloadSchemaType]]] = {
     ],
     IMPROVEMENT_LOG: [
         ("category",         PayloadSchemaType.KEYWORD),
+        ("approved",         PayloadSchemaType.BOOL),
         ("applied_at",       PayloadSchemaType.KEYWORD),
     ],
 }

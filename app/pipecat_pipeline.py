@@ -88,6 +88,7 @@ from pipecat.frames.frames import (
     AudioRawFrame,
     EndFrame,
     Frame,
+    InputAudioRawFrame,
     TextFrame,
     TranscriptionFrame,
 )
@@ -1796,7 +1797,7 @@ class VoicePipelineManager:
 
     async def push_audio(self, pcm_bytes: bytes, sample_rate: int = 48000):
         """Inject a raw PCM audio chunk from the browser into the pipeline."""
-        frame = AudioRawFrame(
+        frame = InputAudioRawFrame(
             audio=pcm_bytes,
             sample_rate=sample_rate,
             num_channels=1,

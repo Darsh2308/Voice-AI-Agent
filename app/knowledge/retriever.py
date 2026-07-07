@@ -30,6 +30,7 @@ Critical chunk guarantee
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 
@@ -227,15 +228,33 @@ class RetrievalPipeline:
 
         # 1. Critical chunk injection (deterministic, always runs)
         inject_purchase, inject_otp = _needs_critical_chunks(query)
-        critical_chunks: list[RetrievedChunk] = []
+
+        # Start critical chunk fetches and query embedding concurrently to save network round trips
+        tasks = []
+        purchase_task = None
+        otp_task = None
 
         if inject_purchase:
-            cc = await self._fetch_critical("KB-CORP-001")
+            purchase_task = asyncio.create_task(self._fetch_critical("KB-CORP-001"))
+            tasks.append(purchase_task)
+        if inject_otp:
+            otp_task = asyncio.create_task(self._fetch_critical("KB-POL-002"))
+            tasks.append(otp_task)
+
+        embed_task = asyncio.create_task(embed_text(query, prefix="query"))
+        tasks.append(embed_task)
+
+        # Await all parallel operations
+        await asyncio.gather(*tasks)
+
+        critical_chunks: list[RetrievedChunk] = []
+        if purchase_task:
+            cc = purchase_task.result()
             critical_chunks.extend(cc)
             logger.debug(f"retrieve: injected {len(cc)} purchase-rule critical chunks")
 
-        if inject_otp:
-            cc = await self._fetch_critical("KB-POL-002")
+        if otp_task:
+            cc = otp_task.result()
             critical_chunks.extend(cc)
             logger.debug(f"retrieve: injected {len(cc)} OTP-guard critical chunks")
 
@@ -246,7 +265,7 @@ class RetrievalPipeline:
             logger.debug(f"retrieve: topic filter → topics={topics}")
 
         # 3. Embed query with "query: " prefix (E5 convention)
-        query_vector = await embed_text(query, prefix="query")
+        query_vector = embed_task.result()
 
         # 4. Vector search
         fetch_k = top_k * 3 if RERANKER_ENABLED else top_k
