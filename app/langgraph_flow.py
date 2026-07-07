@@ -264,11 +264,26 @@ except ImportError:
 # _open_stream error handling below — stacking the SDK's own backoff on top of
 # that would compound delays instead of bounding them.
 _VOICE_LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
+# httpx defaults keepalive_expiry to 5.0s — the pooled HTTPS connection to
+# Gemini's endpoint is torn down after just 5s idle. Normal gaps between voice
+# turns (user thinking/speaking/listening) routinely exceed that, so nearly
+# every turn after a pause paid a FULL TCP+TLS handshake to Google's endpoint
+# before the request could even be sent — a likely dominant contributor to the
+# occasional 5s+ stalls hitting the read timeout above (the handshake +
+# prefill time together crossing 5s, not the model itself being slow).
+# keepalive_expiry=60.0 keeps the connection warm across ordinary
+# conversational gaps so most turns reuse it instead of re-handshaking.
+_VOICE_LLM_LIMITS = httpx.Limits(
+    max_connections=20,
+    max_keepalive_connections=10,
+    keepalive_expiry=60.0,
+)
 _voice_llm = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
     base_url=GEMINI_BASE_URL,
     timeout=_VOICE_LLM_TIMEOUT,
     max_retries=0,
+    http_client=httpx.AsyncClient(timeout=_VOICE_LLM_TIMEOUT, limits=_VOICE_LLM_LIMITS),
 )
 
 

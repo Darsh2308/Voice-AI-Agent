@@ -963,6 +963,15 @@ class GroqLangGraphProcessor(FrameProcessor):
             f"LLM: barge-in was a false positive (no real speech followed) — "
             f"resuming {len(sentences)} cancelled sentence(s)"
         )
+        # The frontend closes its audio-playback gate on barge_in/interrupted
+        # and only reopens it on a fresh {"type":"thinking","active":true}
+        # message (see useWebSocket.ts's acceptAudioRef) — otherwise it
+        # silently drops audio from a "cancelled" turn so a stale reply can't
+        # resume by mistake. Without re-sending that signal here, THIS
+        # legitimate resume would be dropped client-side even though the
+        # server delivered it correctly.
+        await self.push_frame(AIThinkingFrame(thinking=True))
+        await self.push_frame(AIThinkingFrame(thinking=False))
         for sentence in sentences:
             await self.push_frame(TextFrame(text=sentence))
         await self.push_frame(
