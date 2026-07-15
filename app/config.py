@@ -62,6 +62,18 @@ DREAM_DAILY_TOKEN_BUDGET   = int(os.getenv("DREAM_DAILY_TOKEN_BUDGET", "200000")
 # just an env flip. Remove the batch path only after streaming is verified live.
 TTS_STREAMING = os.getenv("TTS_STREAMING", "true").lower() == "true"
 
+# ── STT transport ───────────────────────────────────────────────────────────
+# Mirrors TTS_STREAMING. Default false: the batch HTTP path (SarvamSTTService)
+# remains the exact prior behavior until the streaming path (SarvamSTTStreamingService)
+# is verified against a real live call. When true, audio is streamed to
+# Sarvam's STT WebSocket continuously as the user speaks — instead of one
+# blocking batch call after silence is detected — so ASR compute overlaps
+# their speaking time. Falls back to the batch path automatically per
+# utterance on any streaming failure/timeout, so flipping this on can only
+# change latency, never reliability. Flip back to false instantly via .env,
+# no redeploy, if anything looks wrong live.
+STT_STREAMING = os.getenv("STT_STREAMING", "false").lower() == "true"
+
 # ── Sarvam speech models (single source of truth) ─────────────────────────────
 # Migrate Sarvam STT/TTS versions from .env only — never hardcode model IDs or
 # speakers in app code. Defaults track Sarvam's current recommendations:

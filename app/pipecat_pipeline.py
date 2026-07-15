@@ -99,6 +99,7 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 
 from app.config import (
     SARVAM_API_KEY,
+    STT_STREAMING,
     TTS_STREAMING,
     SARVAM_STT_MODEL,
     SARVAM_STT_MODE,
@@ -135,6 +136,37 @@ class SpeechEndFrame(Frame):
         super().__init__()
         self.audio_bytes = audio_bytes
         self.sample_rate = sample_rate
+
+
+class SpeechStartedFrame(Frame):
+    """
+    Streaming STT: emitted by VADProcessor exactly once per utterance, the
+    moment speech is CONFIRMED active (the same transition that today only
+    flips the internal _is_speech_active flag — see MIN_SPEECH_CHUNKS /
+    MIN_SPEECH_CHUNKS_BARGEIN below). Lets SarvamSTTStreamingService open its
+    per-utterance WebSocket to Sarvam as early as possible, so the connection
+    handshake overlaps with the user still talking instead of landing on the
+    latency-critical tail after they stop.
+
+    Internal frame only — never forwarded to OutputSink/main.py/the browser.
+    """
+    pass
+
+
+class SpeechChunkFrame(Frame):
+    """
+    Streaming STT: emitted by VADProcessor for every 16 kHz PCM chunk added to
+    _audio_buffer while an utterance is active (mirrors exactly what the
+    batch WAV would contain — both confirmed-speech chunks and the trailing
+    silence chunks before the utterance is declared over). Lets
+    SarvamSTTStreamingService stream audio to Sarvam in near-real-time instead
+    of waiting for SpeechEndFrame's complete WAV.
+
+    Internal frame only — never forwarded to OutputSink/main.py/the browser.
+    """
+    def __init__(self, pcm_16k: bytes):
+        super().__init__()
+        self.pcm_16k = pcm_16k
 
 
 class TranscriptDisplayFrame(Frame):
@@ -522,14 +554,30 @@ class VADProcessor(FrameProcessor):
                 logger.info(f"VAD: BARGE-IN fired after {self._speech_chunks_seen} chunks (prob={prob:.2f})")
                 await self.push_frame(BargeInDetectedFrame())
 
+            just_activated = False
             if not self._is_speech_active:
                 if self._speech_chunks_seen >= self.MIN_SPEECH_CHUNKS:
                     self._is_speech_active = True
+                    just_activated = True
                     logger.debug(f"VAD: speech STARTED (prob={prob:.2f}, barge_in={self._barge_in_mode})")
 
             # Feature 10: track energy during active speech
             if self._is_speech_active:
                 self._track_energy(pcm_16k)
+
+                # Streaming STT: on the activation transition, backfill every
+                # chunk that accumulated in _audio_buffer during the
+                # MIN_SPEECH_CHUNKS/MIN_SPEECH_CHUNKS_BARGEIN confirmation
+                # window (appended above, before _is_speech_active was true,
+                # so never individually streamed yet) so SarvamSTTStreamingService
+                # sees the exact same audio the batch WAV would contain — no
+                # gap at the start of the utterance. Then stream this call's
+                # own chunk exactly once, same as every subsequent call.
+                if just_activated:
+                    await self.push_frame(SpeechStartedFrame())
+                    for buffered_chunk in self._audio_buffer[:-1]:
+                        await self.push_frame(SpeechChunkFrame(buffered_chunk))
+                await self.push_frame(SpeechChunkFrame(pcm_16k))
 
         else:
             # ── SILENCE chunk (or a Silero-positive chunk that failed the
@@ -537,6 +585,10 @@ class VADProcessor(FrameProcessor):
             if self._is_speech_active:
                 self._silence_chunk_count += 1
                 self._audio_buffer.append(pcm_16k)
+                # Streaming STT: trailing silence chunks are part of the same
+                # utterance's audio (the batch WAV includes them too) — stream
+                # them same as active-speech chunks above.
+                await self.push_frame(SpeechChunkFrame(pcm_16k))
 
                 # Feature 4: use shorter silence window during barge-in for faster response
                 silence_needed = (
@@ -752,68 +804,9 @@ class SarvamSTTService(FrameProcessor):
             logger.info(f"STT transcript: {transcript!r}")
             logger.info(f"LATENCY stt_ms={stt_ms}")
 
-            # ── Feature 7: Language detection ──────────────────────────────
-            # Sarvam returns the detected language code in the response.
-            # We normalise it, then apply a romanized-language correction pass:
-            # Sarvam's auto-detect sometimes returns "en" for romanized Indian
-            # speech (e.g. Hinglish, romanized Marathi, etc.) because the text
-            # looks Latin-script. We scan the transcript for known function words
-            # of each Indian language and override when we get ≥2 hits.
-            raw_lang = resp_json.get("language_code", "en")
-            detected = self.LANG_NORMALIZE.get(raw_lang, raw_lang)
-
-            if detected == "en-IN" and transcript:
-                words = set(transcript.lower().replace(",", " ").replace(".", " ").split())
-                best_lang  = None
-                best_count = 0
-                for lang_code, markers in self.ROMANIZED_MARKERS.items():
-                    hits = len(words & markers)
-                    if hits > best_count:
-                        best_count = hits
-                        best_lang  = lang_code
-                if best_count >= 2 and best_lang:
-                    logger.info(
-                        f"STT: romanized {best_lang} detected ({best_count} markers) — "
-                        f"overriding language en-IN → {best_lang}"
-                    )
-                    detected = best_lang
-
-            logger.info(f"STT: language={detected!r}")
-            await self.push_frame(LanguageDetectedFrame(language_code=detected))
-
-            # ── Feature 10: Emotion hint from confidence ────────────────────
-            # Sarvam may return a confidence score. Low confidence suggests
-            # the user was hesitant, unclear, or mumbling.
+            raw_lang   = resp_json.get("language_code", "en")
             confidence = float(resp_json.get("confidence", 1.0))
-            if confidence < 0.6:
-                logger.info(f"STT: low confidence ({confidence:.2f}) → hesitant emotion hint")
-                await self.push_frame(EmotionHintFrame(hint="hesitant"))
-
-            # ── Noise / filler filter ──────────────────────────────────────
-            cleaned = transcript.lower().rstrip(".,!? ")
-            if not cleaned or len(cleaned) <= 2 or cleaned in self.FILLER_WORDS:
-                logger.debug(f"STT: filtered noise/filler {transcript!r}")
-                # This utterance produced nothing usable. If it followed a
-                # barge-in, that barge-in was a false positive (background
-                # noise, not real speech) — NoSpeechDetectedFrame lets
-                # GroqLangGraphProcessor RESUME whatever AI turn got cut off
-                # instead of silently leaving the call in dead air. A no-op
-                # when no turn is paused (e.g. plain background noise between
-                # turns, nothing was interrupted).
-                await self.push_frame(NoSpeechDetectedFrame())
-                return
-
-            # ── Emit frames downstream ─────────────────────────────────────
-            # ORDERING: push user display frame FIRST, then the transcription.
-            # TranscriptionFrame triggers a long-running LLM call which blocks
-            # the pipeline. Pushing the display frame first ensures the user's
-            # text bubble appears in the browser BEFORE the AI response audio.
-            await self.push_frame(
-                TranscriptDisplayFrame(text=transcript, speaker="user")
-            )
-            await self.push_frame(
-                TranscriptionFrame(text=transcript, user_id="user", timestamp="")
-            )
+            await _finalize_transcript(self.push_frame, transcript, raw_lang, confidence)
 
         except Exception as e:
             logger.error(f"STT error: {e}")
@@ -825,6 +818,334 @@ class SarvamSTTService(FrameProcessor):
 
     async def cleanup(self):
         await self._http.aclose()
+
+
+async def _finalize_transcript(
+    push_frame,
+    transcript: str,
+    raw_lang: str,
+    confidence: float | None,
+) -> None:
+    """
+    Shared post-processing for a FINALIZED STT result — used by both
+    SarvamSTTService (batch HTTP) and SarvamSTTStreamingService (streaming
+    WebSocket, see below) so downstream behavior is byte-identical no matter
+    which transport produced the transcript: romanized-language override,
+    Feature 10 confidence-based emotion hint, filler/noise filtering, and
+    frame emission order (display frame before TranscriptionFrame — the
+    latter triggers the long-running LLM call, so the user's chat bubble
+    must land first).
+
+    confidence=None (the streaming path's response has no confidence score)
+    skips the hesitant-hint emission entirely — a documented gap, not a
+    silent one; VAD-energy-based "agitated" detection is unaffected since it
+    lives entirely in VADProcessor.
+    """
+    # ── Feature 7: Language detection ──────────────────────────────────────
+    # Sarvam returns the detected language code in the response. We normalise
+    # it, then apply a romanized-language correction pass: Sarvam's
+    # auto-detect sometimes returns "en" for romanized Indian speech (e.g.
+    # Hinglish, romanized Marathi) because the text looks Latin-script. We
+    # scan the transcript for known function words of each Indian language
+    # and override when we get ≥2 hits.
+    detected = SarvamSTTService.LANG_NORMALIZE.get(raw_lang, raw_lang)
+
+    if detected == "en-IN" and transcript:
+        words = set(transcript.lower().replace(",", " ").replace(".", " ").split())
+        best_lang  = None
+        best_count = 0
+        for lang_code, markers in SarvamSTTService.ROMANIZED_MARKERS.items():
+            hits = len(words & markers)
+            if hits > best_count:
+                best_count = hits
+                best_lang  = lang_code
+        if best_count >= 2 and best_lang:
+            logger.info(
+                f"STT: romanized {best_lang} detected ({best_count} markers) — "
+                f"overriding language en-IN → {best_lang}"
+            )
+            detected = best_lang
+
+    logger.info(f"STT: language={detected!r}")
+    await push_frame(LanguageDetectedFrame(language_code=detected))
+
+    # ── Feature 10: Emotion hint from confidence ────────────────────────────
+    if confidence is not None and confidence < 0.6:
+        logger.info(f"STT: low confidence ({confidence:.2f}) → hesitant emotion hint")
+        await push_frame(EmotionHintFrame(hint="hesitant"))
+
+    # ── Noise / filler filter ────────────────────────────────────────────────
+    cleaned = transcript.lower().rstrip(".,!? ")
+    if not cleaned or len(cleaned) <= 2 or cleaned in SarvamSTTService.FILLER_WORDS:
+        logger.debug(f"STT: filtered noise/filler {transcript!r}")
+        # This utterance produced nothing usable. If it followed a barge-in,
+        # that barge-in was a false positive (background noise, not real
+        # speech) — NoSpeechDetectedFrame lets GroqLangGraphProcessor RESUME
+        # whatever AI turn got cut off instead of silently leaving the call in
+        # dead air. A no-op when no turn is paused (e.g. plain background
+        # noise between turns, nothing was interrupted).
+        await push_frame(NoSpeechDetectedFrame())
+        return
+
+    # ── Emit frames downstream ───────────────────────────────────────────────
+    # ORDERING: push user display frame FIRST, then the transcription.
+    # TranscriptionFrame triggers a long-running LLM call which blocks the
+    # pipeline. Pushing the display frame first ensures the user's text
+    # bubble appears in the browser BEFORE the AI response audio.
+    await push_frame(TranscriptDisplayFrame(text=transcript, speaker="user"))
+    await push_frame(TranscriptionFrame(text=transcript, user_id="user", timestamp=""))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b.  SarvamSTTStreamingService  (Speech-to-Text over the streaming WebSocket)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Flag-gated alternative to SarvamSTTService (batch HTTP), enabled by
+# STT_STREAMING=true. Chosen in VoicePipelineManager; when the flag is off
+# this class is never instantiated and behavior is byte-identical to before.
+#
+# WHY THIS EXISTS: the batch path waits for VADProcessor to buffer the WHOLE
+# utterance (~1s of trailing silence) before making a single blocking HTTP
+# call to Sarvam ASR — the LLM turn cannot start until that full round-trip
+# completes. This service instead streams each 16kHz PCM chunk to Sarvam's
+# STT WebSocket AS THE USER SPEAKS (fed by VADProcessor's new
+# SpeechStartedFrame/SpeechChunkFrame), so ASR compute overlaps their
+# speaking time. When VAD detects silence and emits SpeechEndFrame, we send
+# a flush signal and the finalized transcript is typically ready almost
+# immediately — most of the work already happened during the pause we used
+# to spend waiting idle.
+#
+# This does NOT stream word-by-word interim text to the LLM: Sarvam's
+# streaming response is a FINALIZED transcript per utterance (confirmed
+# against the real API's documented protocol), not incremental partial
+# tokens, and the LLM still only starts once on the one complete transcript
+# — feeding partial fragments into a sales-agent LLM turn would produce
+# premature, incoherent replies to half a sentence.
+#
+# FAILS SAFE: any connect failure, mid-utterance drop, or a flush that
+# doesn't produce a transcript within FINALIZE_TIMEOUT_SECS falls back to
+# the exact same batch HTTP call SarvamSTTService already makes, using the
+# complete WAV VADProcessor buffers into SpeechEndFrame regardless of
+# whether streaming is in use. Reliability can never regress below the
+# pre-streaming behavior — only latency changes.
+#
+# Sarvam's streaming response has no confidence score, so the Feature 10
+# "hesitant" emotion hint (EmotionHintFrame from low ASR confidence) is only
+# ever emitted via the batch fallback path, never on a streaming success —
+# see _finalize_transcript's confidence=None handling above. A documented
+# gap, not a silent one; VAD-energy-based "agitated" detection is unaffected
+# since it lives entirely in VADProcessor.
+#
+# Receives:  SpeechStartedFrame, SpeechChunkFrame, SpeechEndFrame
+# Emits:     same contract as SarvamSTTService — TranscriptDisplayFrame,
+#            TranscriptionFrame, LanguageDetectedFrame, EmotionHintFrame,
+#            NoSpeechDetectedFrame
+#
+
+_STT_END_SENTINEL = object()   # marks the queue item that carries SpeechEndFrame
+
+
+class SarvamSTTStreamingService(FrameProcessor):
+    """Streaming Sarvam STT over a per-utterance WebSocket. See section header."""
+
+    SARVAM_STT_WS = "wss://api.sarvam.ai/speech-to-text/ws"
+    # Bounded — never block a turn indefinitely waiting on a flush response.
+    # On timeout we fall back to the batch path (see _run_utterance).
+    FINALIZE_TIMEOUT_SECS = 3.0
+
+    def __init__(self, api_key: str, **kwargs):
+        super().__init__(**kwargs)
+        self._api_key = api_key
+        # Batch fallback REUSES SarvamSTTService's own HTTP client + _transcribe
+        # logic rather than duplicating it — one implementation, two transports.
+        self._batch_fallback = SarvamSTTService(api_key=api_key)
+        # Per-utterance queue + worker task. Reassigned fresh on every
+        # SpeechStartedFrame; the previous utterance's worker (if any) is left
+        # to finish independently via its own captured closure variables, not
+        # shared mutable state — mirrors SarvamTTSStreamingService's per-turn
+        # isolation pattern (pipecat_pipeline.py, SarvamTTSStreamingService).
+        self._queue: asyncio.Queue | None = None
+        self._worker_task: asyncio.Task | None = None
+
+    # ── Pipecat frame handler ─────────────────────────────────────────────────
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, SpeechStartedFrame):
+            queue = asyncio.Queue()
+            self._queue = queue
+            self._worker_task = asyncio.create_task(
+                self._run_utterance(queue, time.monotonic())
+            )
+
+        elif isinstance(frame, SpeechChunkFrame):
+            if self._queue is not None:
+                self._queue.put_nowait(frame.pcm_16k)
+            # else: no SpeechStartedFrame was ever observed for this utterance
+            # (shouldn't happen given VADProcessor's emission order) — dropping
+            # is safe since SpeechEndFrame's WAV is a complete, independent copy.
+
+        elif isinstance(frame, SpeechEndFrame):
+            # Non-blocking handoff: the per-utterance worker task (already
+            # running since SpeechStartedFrame) does the flush + finalize +
+            # fallback entirely off this call stack. process_frame returns
+            # immediately so VAD is free to start buffering the NEXT utterance
+            # right away — never repeat the old TTS bug where a slow network
+            # wait inside process_frame stalled the whole pipeline.
+            if self._queue is not None:
+                await self._queue.put((_STT_END_SENTINEL, frame))
+            else:
+                logger.warning(
+                    "STT(stream): SpeechEndFrame with no active utterance — "
+                    "going straight to batch fallback"
+                )
+                asyncio.create_task(self._batch_fallback._transcribe(frame))
+            self._queue = None
+            self._worker_task = None
+
+        else:
+            await self.push_frame(frame, direction)
+
+    # ── Per-utterance worker: connect, stream chunks, flush, finalize ─────────
+
+    async def _run_utterance(self, queue: asyncio.Queue, connect_t0: float):
+        """
+        One background task per utterance — owns the entire streaming
+        lifecycle so nothing in this class ever blocks process_frame:
+          1. Open the WS and start a receiver reading transcript/error events.
+          2. Drain queued PCM chunks, sending each to Sarvam as it arrives.
+          3. On the end-sentinel (SpeechEndFrame handed off above): send flush,
+             wait (bounded) for the post-flush finalized transcript.
+          4. On any failure/timeout: fall back to the batch HTTP path using
+             the SpeechEndFrame's own complete WAV — same guaranteed-safe path
+             SarvamSTTService already uses today.
+        """
+        params = {
+            "language-code": "unknown",
+            "model": SARVAM_STT_MODEL,
+            "sample_rate": "16000",
+            "input_audio_codec": "pcm_s16le",
+            # We rely on OUR OWN Silero VAD for utterance boundaries (already
+            # tuned — noise floor, barge-in, etc.), not Sarvam's server-side
+            # VAD, so vad_signals/high_vad_sensitivity are deliberately left
+            # unset. flush_signal=true is what lets our flush force-finalize.
+            "flush_signal": "true",
+        }
+        if SARVAM_STT_MODEL.startswith("saaras"):
+            params["mode"] = SARVAM_STT_MODE
+        url = f"{self.SARVAM_STT_WS}?{urlencode(params)}"
+
+        ws = None
+        stream_failed  = False
+        latest_result: dict | None = None
+        end_frame: SpeechEndFrame | None = None
+        got_result     = asyncio.Event()
+        flush_sent_at: float | None = None
+
+        async def receiver():
+            """Reads transcript/error events. Only treats a 'data' message as
+            FINAL once it arrives after we've sent flush — Sarvam may (rarely)
+            emit an earlier data event mid-utterance; we keep the latest one
+            but only stop waiting once it's the post-flush result."""
+            nonlocal latest_result, stream_failed
+            async for raw in ws:
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning(f"STT(stream): non-JSON message ignored: {raw[:200]!r}")
+                    continue
+                etype = ev.get("type")
+                if etype == "data":
+                    data = ev.get("data") or {}
+                    latest_result = {
+                        "transcript":     data.get("transcript", ""),
+                        "language_code":  data.get("language_code"),
+                    }
+                    if flush_sent_at is not None:
+                        got_result.set()
+                        return
+                elif etype == "error":
+                    logger.error(f"STT(stream): error event {json.dumps(ev)[:300]}")
+                    stream_failed = True
+                    got_result.set()
+                    return
+                # etype == "events" (VAD signals) — not requested (vad_signals
+                # unset above), ignored defensively if any arrive anyway.
+
+        try:
+            ws = await websockets.connect(
+                url, additional_headers={"Api-Subscription-Key": self._api_key}
+            )
+            logger.info(
+                f"LATENCY stt_stream_connect_ms={int((time.monotonic() - connect_t0) * 1000)}"
+            )
+            receiver_task = asyncio.create_task(receiver())
+
+            while end_frame is None:
+                item = await queue.get()
+                if isinstance(item, tuple) and item[0] is _STT_END_SENTINEL:
+                    end_frame = item[1]
+                    flush_sent_at = time.monotonic()
+                    await ws.send(json.dumps({"type": "flush"}))
+                    break
+                await ws.send(json.dumps({
+                    "audio": {
+                        "data":         base64.b64encode(item).decode("ascii"),
+                        "sample_rate":  "16000",
+                        "encoding":     "audio/pcm_s16le",
+                    }
+                }))
+
+            try:
+                await asyncio.wait_for(got_result.wait(), timeout=self.FINALIZE_TIMEOUT_SECS)
+            except asyncio.TimeoutError:
+                logger.warning("STT(stream): finalize timed out — falling back to batch")
+                stream_failed = True
+
+            if not receiver_task.done():
+                receiver_task.cancel()
+            try:
+                await receiver_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Connect failed, or the socket dropped mid-utterance (ws.send
+            # raised inside the while-loop above). Either way: drain the
+            # queue until we find the end-sentinel so we still have the
+            # SpeechEndFrame's WAV bytes to fall back on — the alternative
+            # (bailing out early) would silently lose this utterance.
+            logger.warning(f"STT(stream): connection failed/dropped (falling back to batch): {exc}")
+            stream_failed = True
+            while end_frame is None:
+                item = await queue.get()
+                if isinstance(item, tuple) and item[0] is _STT_END_SENTINEL:
+                    end_frame = item[1]
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+        if not stream_failed and latest_result is not None:
+            finalize_ms = int((time.monotonic() - flush_sent_at) * 1000)
+            logger.info(f"LATENCY stt_stream_finalize_ms={finalize_ms}")
+            logger.info("STT: streaming path used")
+            transcript = latest_result["transcript"].strip()
+            raw_lang   = latest_result.get("language_code") or "en"
+            await _finalize_transcript(self.push_frame, transcript, raw_lang, confidence=None)
+        else:
+            logger.warning("STT: falling back to batch HTTP path for this utterance")
+            await self._batch_fallback._transcribe(end_frame)
+
+    async def cleanup(self):
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+        await self._batch_fallback.cleanup()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1926,7 +2247,15 @@ class VoicePipelineManager:
         )
 
         self._vad  = VADProcessor()
-        self._stt  = SarvamSTTService(api_key=SARVAM_API_KEY)
+        # STT transport is flag-selectable. Default (flag off) = batch HTTP,
+        # byte-identical to before. STT_STREAMING=true = streaming WebSocket
+        # (audio streamed to Sarvam as the user speaks; falls back to batch
+        # per-utterance on any failure — see SarvamSTTStreamingService).
+        if STT_STREAMING:
+            self._stt = SarvamSTTStreamingService(api_key=SARVAM_API_KEY)
+            logger.info("STT: streaming WebSocket mode ENABLED (STT_STREAMING=true)")
+        else:
+            self._stt = SarvamSTTService(api_key=SARVAM_API_KEY)
         # TTS transport is flag-selectable. Default (flag off) = batch HTTP,
         # byte-identical to before. TTS_STREAMING=true = streaming WebSocket.
         if TTS_STREAMING:
